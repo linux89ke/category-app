@@ -12,10 +12,9 @@ import faiss
 # 1. SETUP & CONFIGURATION
 # ==========================================
 st.set_page_config(page_title="Category Matching Engine", layout="wide")
-st.title("🧠 Ultimate Category Engine (FAISS + Learning + Analytics)")
+st.title("🧠 Ultimate Category Engine (Batched + FAISS)")
 
 DB_PATH = "learning.db"
-# Pointing directly to your Excel file
 CATEGORY_FILE = "category_map_fully_enriched.xlsx" 
 PROCESSED_DATA_FILE = "category_map_with_embeddings.pkl"
 
@@ -39,7 +38,7 @@ def init_db():
 init_db()
 
 # ==========================================
-# 3. LOAD AI MODEL (Cached so it only loads once)
+# 3. LOAD AI MODEL
 # ==========================================
 @st.cache_resource
 def load_model():
@@ -48,59 +47,41 @@ def load_model():
 model = load_model()
 
 # ==========================================
-# 4. LOAD DATA & EMBEDDINGS (Optimized for Speed)
+# 4. LOAD DATA & EMBEDDINGS 
 # ==========================================
-# Check if we already processed and saved the data
 if os.path.exists(PROCESSED_DATA_FILE):
     with open(PROCESSED_DATA_FILE, "rb") as f:
         df = pickle.load(f)
 else:
     if not os.path.exists(CATEGORY_FILE):
-        st.error(f"❌ File not found: `{CATEGORY_FILE}`. Please make sure the exact file name is in the same folder as this script.")
-        # Debugging: Show files in the directory so you know what Python sees
-        st.write("Files in current folder:", os.listdir())
+        st.error(f"❌ File not found: `{CATEGORY_FILE}`.")
         st.stop()
         
-    st.info("First run detected! Crunching AI embeddings... this will take a minute but will be instant next time.")
-    
-    # Load the raw Excel file (requires 'openpyxl' in requirements.txt)
+    st.info("First run detected! Crunching AI embeddings...")
     df = pd.read_excel(CATEGORY_FILE)
-    
-    # Standardize headers (e.g., "Category Path" -> "category_path")
     df.columns = df.columns.str.lower().str.strip().str.replace(' ', '_')
 
-    # Ensure required columns exist
     if "category_code" not in df.columns:
         df["category_code"] = df.index.astype(str)
 
-    if "enriched_keywords" in df.columns:
-        keywords = df["enriched_keywords"].fillna("").astype(str)
-    else:
-        keywords = ""
-
-    # Create the text for the vector embeddings
+    keywords = df["enriched_keywords"].fillna("").astype(str) if "enriched_keywords" in df.columns else ""
     df["category_text"] = df["category_path"].astype(str) + " " + keywords
     
-    # Calculate embeddings (This is the slow part we want to save)
     embeddings = model.encode(df["category_text"].tolist(), convert_to_numpy=True)
     df["embedding"] = list(embeddings)
     
-    # Save to disk using Pickle for instant loading next time
     with open(PROCESSED_DATA_FILE, "wb") as f:
         pickle.dump(df, f)
         
-    st.success("✅ Embeddings saved for future use!")
+    st.success("✅ Embeddings saved!")
 
 # ==========================================
-# 5. BUILD FAISS INDEX (Takes milliseconds)
+# 5. BUILD FAISS INDEX
 # ==========================================
 embeddings_matrix = np.vstack(df["embedding"].values).astype('float32')
 faiss.normalize_L2(embeddings_matrix)
-
 index = faiss.IndexFlatIP(embeddings_matrix.shape[1])
 index.add(embeddings_matrix)
-
-st.success("System Ready ⚡")
 
 # ==========================================
 # 6. APP SETTINGS & LEARNING DATA
@@ -118,18 +99,15 @@ def get_learning():
 learn_df = get_learning()
 
 # ==========================================
-# 7. CORE MATCHING LOGIC
+# 7. CORE MATCHING LOGIC (Single)
 # ==========================================
 def match_query(query):
     q = str(query).lower()
-
-    # 1. Check if we already learned this exact product
     learned = learn_df[learn_df["query"] == q]
     if not learned.empty:
         row = learned.iloc[-1]
-        return row["correct_category"], row["category_code"], 100.0, pd.DataFrame() # Empty df for candidates
+        return row["correct_category"], row["category_code"], 100.0, pd.DataFrame() 
 
-    # 2. Semantic Search (FAISS)
     q_emb = model.encode([q], convert_to_numpy=True).astype('float32')
     faiss.normalize_L2(q_emb)
 
@@ -137,15 +115,15 @@ def match_query(query):
     candidates = df.iloc[indices[0]].copy()
     candidates["semantic_score"] = scores[0]
 
-    # 3. Fuzzy Matching (RapidFuzz)
-    def fuzzy_score(x):
-        return fuzz.token_set_ratio(q, str(x)) if pd.notna(x) else 0
-
     keyword_col = "enriched_keywords" if "enriched_keywords" in candidates.columns else "category_path"
-    candidates["keyword_score"] = candidates[keyword_col].apply(fuzzy_score)
+    candidates["keyword_score"] = candidates[keyword_col].apply(
+        lambda x: fuzz.token_set_ratio(q, str(x)) if pd.notna(x) else 0
+    )
 
-    # 4. Final Score Calculation
     candidates["final_score"] = (candidates["keyword_score"] * 0.5) + (candidates["semantic_score"] * 100 * 0.5)
+    
+    # Sort by the combined final score to ensure the absolute best match is at the top
+    candidates = candidates.sort_values(by="final_score", ascending=False)
     best = candidates.iloc[0]
 
     if best["final_score"] < threshold:
@@ -154,45 +132,99 @@ def match_query(query):
         return best["category_path"], best["category_code"], best["final_score"], candidates
 
 # ==========================================
-# 8. UI: SINGLE MATCH
+# 8. HIGH-SPEED BATCH LOGIC (For Bulk Uploads)
+# ==========================================
+def batch_match_queries(queries):
+    results = []
+    
+    # Pre-load learned dictionary for instant O(1) lookups
+    learned_dict = {row["query"]: (row["correct_category"], row["category_code"]) for _, row in learn_df.iterrows()}
+    
+    needs_ai_indices = []
+    needs_ai_queries = []
+    
+    # Filter out empty queries and check if we already learned the answer
+    for i, q in enumerate(queries):
+        if pd.isna(q) or str(q).strip() == "":
+            continue
+            
+        q_lower = str(q).lower()
+        if q_lower in learned_dict:
+            cat, code = learned_dict[q_lower]
+            results.append({"index": i, "product": q, "category": cat, "category_code": code, "score": 100.0})
+        else:
+            needs_ai_indices.append(i)
+            needs_ai_queries.append(q_lower)
+            
+    # If we have queries that need the AI, process them ALL AT ONCE
+    if needs_ai_queries:
+        # 1. Batch Encode (32 items at a time internally)
+        q_embs = model.encode(needs_ai_queries, batch_size=32, convert_to_numpy=True).astype('float32')
+        faiss.normalize_L2(q_embs)
+        
+        # 2. Batch Search FAISS
+        all_scores, all_indices = index.search(q_embs, top_k)
+        
+        # 3. Score combinations
+        keyword_col = "enriched_keywords" if "enriched_keywords" in df.columns else "category_path"
+        
+        for idx, q_text, scores, indices_row in zip(needs_ai_indices, needs_ai_queries, all_scores, all_indices):
+            candidates = df.iloc[indices_row].copy()
+            candidates["semantic_score"] = scores
+            candidates["keyword_score"] = candidates[keyword_col].apply(
+                lambda x: fuzz.token_set_ratio(q_text, str(x)) if pd.notna(x) else 0
+            )
+            candidates["final_score"] = (candidates["keyword_score"] * 0.5) + (candidates["semantic_score"] * 100 * 0.5)
+            candidates = candidates.sort_values(by="final_score", ascending=False)
+            best = candidates.iloc[0]
+            
+            if best["final_score"] < threshold:
+                results.append({"index": idx, "product": queries[idx], "category": "REJECTED", "category_code": None, "score": best["final_score"]})
+            else:
+                results.append({"index": idx, "product": queries[idx], "category": best["category_path"], "category_code": best["category_code"], "score": best["final_score"]})
+                
+    # Re-sort results back to original CSV order
+    results = sorted(results, key=lambda x: x["index"])
+    
+    # Clean up the "index" key before returning
+    for r in results:
+        del r["index"]
+        
+    return results
+
+# ==========================================
+# 9. UI: SINGLE MATCH
 # ==========================================
 st.subheader("🔍 Single Match")
-query = st.text_input("Enter product name (e.g., 'Galaxy Buds 2 Pro')")
+query = st.text_input("Enter product name")
 
 if query:
     match, code, score, candidates = match_query(query)
-
     if match == "REJECTED":
         st.warning(f"❌ Rejected (Score: {score:.2f})")
-        if not candidates.empty:
-            st.dataframe(candidates[["category_path", "category_code", "final_score"]])
     else:
         st.success(f"✅ {match} (Code: {code}) | Score: {score:.2f}")
 
-    # Manual override / Learning
-    with st.expander("Teach the Engine (Override)"):
+    with st.expander("Teach the Engine"):
         correct = st.text_input("Correct category path")
-        correct_code = st.text_input("Correct category code")
-
+        correct_code = st.text_input("Correct code")
         if st.button("Save Learning") and correct:
             conn = sqlite3.connect(DB_PATH)
             c = conn.cursor()
-            c.execute("INSERT INTO feedback (query, correct_category, category_code) VALUES (?, ?, ?)",
-                      (query.lower(), correct, correct_code))
+            c.execute("INSERT INTO feedback (query, correct_category, category_code) VALUES (?, ?, ?)", (query.lower(), correct, correct_code))
             conn.commit()
             conn.close()
-            st.success("Learned! ✅ Next time you search this, it will be 100% accurate.")
+            st.success("Learned! ✅")
 
 # ==========================================
-# 9. UI: BULK MATCHING
+# 10. UI: BULK MATCHING
 # ==========================================
 st.divider()
-st.subheader("📂 Bulk Matching")
+st.subheader("📂 Bulk Batch Processing")
 
 bulk_file = st.file_uploader("Upload Product CSV", type=["csv"])
 
 if bulk_file:
-    # Try reading with semicolon first, fallback to comma
     try:
         bulk_df = pd.read_csv(bulk_file, sep=";")
         if len(bulk_df.columns) == 1:
@@ -202,55 +234,33 @@ if bulk_file:
         st.error(f"Error reading CSV: {e}")
         st.stop()
 
-    # Find the column containing the product names
     col = next((c for c in bulk_df.columns if "name" in c.lower() or "product" in c.lower()), None)
 
     if col:
-        st.info(f"Detected product column: `{col}`")
-        if st.button("Start Bulk Process"):
-            results = []
-            progress_bar = st.progress(0)
-            status_text = st.empty()
-            total_items = len(bulk_df)
+        st.info(f"Detected product column: `{col}` ({len(bulk_df)} items)")
+        if st.button("Start High-Speed Process"):
             
-            for i, q in enumerate(bulk_df[col].astype(str)):
-                # Skip empty rows
-                if pd.isna(q) or q.strip() == "":
-                    continue
-                    
-                match, code, score, candidates = match_query(q)
+            with st.spinner(f"Engaging Batch AI Processing for {len(bulk_df)} items... ⚡"):
+                # Pass all items directly to the new Batch Matcher
+                queries_list = bulk_df[col].tolist()
+                results = batch_match_queries(queries_list)
 
-                results.append({
-                    "product": q,
-                    "category": match,
-                    "category_code": code,
-                    "score": score
-                })
-                
-                # Update progress bar every 10 items or on the last item to save UI rendering time
-                if i % 10 == 0 or i == total_items - 1:
-                    progress_bar.progress((i + 1) / total_items)
-                    status_text.text(f"Processing {i + 1} of {total_items}...")
+            st.success("Processing Complete! ✅")
 
-            status_text.text("Processing Complete! ✅")
-
-            # Show results
             out_df = pd.DataFrame(results)
-            st.dataframe(out_df.head(100)) # Show preview
+            st.dataframe(out_df.head(100))
 
             # Analytics
             st.subheader("📊 Analytics")
             total = len(out_df)
             rejected = len(out_df[out_df["category"] == "REJECTED"])
-            avg_score = out_df["score"].mean()
-
+            
             col1, col2, col3 = st.columns(3)
             col1.metric("Total Processed", total)
             col2.metric("Rejected (Needs Review)", rejected)
-            col3.metric("Average Score", round(avg_score, 2))
+            col3.metric("Average Score", round(out_df["score"].mean(), 2))
 
-            # Download button
             csv_data = out_df.to_csv(index=False).encode('utf-8')
             st.download_button("📥 Download Matched Results", csv_data, "categorized_products.csv", "text/csv")
     else:
-        st.error("No product name column found. Found columns: " + ", ".join(bulk_df.columns))
+        st.error("No product name column found.")
