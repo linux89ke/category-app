@@ -11,9 +11,8 @@ st.set_page_config(page_title="Category Matching Engine", layout="wide")
 st.title("⚡ Category Engine (Fuzzy Logic + Learning)")
 
 DB_PATH = "learning.db"
-# Make sure this matches your exact file name. 
-# If it's the CSV you uploaded earlier, use pd.read_csv() below. If it's Excel, use pd.read_excel()
-CATEGORY_FILE = "category_map_fully_enriched.xlsx - Sheet1.csv" 
+# Updated to exactly match your Excel file name
+CATEGORY_FILE = "category_map_fully_enriched.xlsx" 
 
 # ==========================================
 # 2. INITIALIZE DATABASE
@@ -40,13 +39,14 @@ init_db()
 @st.cache_data
 def load_data():
     if not os.path.exists(CATEGORY_FILE):
-        st.error(f"❌ File not found: `{CATEGORY_FILE}`.")
+        st.error(f"❌ File not found: `{CATEGORY_FILE}`. Please ensure it is in the same folder as this script.")
+        st.write("📂 Files Python can see in this folder:", os.listdir())
         st.stop()
         
-    # Load the data (Change to pd.read_excel if it's genuinely an .xlsx file)
-    df = pd.read_csv(CATEGORY_FILE)
+    # Switched to read_excel since it is an .xlsx file
+    df = pd.read_excel(CATEGORY_FILE)
     
-    # Standardize headers
+    # Standardize headers to lowercase with underscores
     df.columns = df.columns.str.lower().str.strip().str.replace(' ', '_')
 
     # Ensure required columns exist
@@ -91,7 +91,6 @@ def match_query(query):
         return row["correct_category"], row["category_code"], 100.0
 
     # 2. RapidFuzz Exact/Fuzzy Search
-    # extractOne returns: (best_match_string, score, index_in_list)
     result = process.extractOne(q, search_choices, scorer=fuzz.token_set_ratio)
     
     if result:
