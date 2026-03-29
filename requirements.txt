@@ -4,3 +4,4 @@ numpy
 rapidfuzz
 sentence-transformers
 faiss-cpu
+openpyxl
