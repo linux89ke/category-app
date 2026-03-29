@@ -11,7 +11,8 @@ st.set_page_config(page_title="Category Matching Engine", layout="wide")
 st.title("🧠 Ultimate Category Engine (FAISS + Learning + Analytics)")
 
 DB_PATH = "learning.db"
-CATEGORY_FILE = "category_map_fully_enriched.xlsx"
+# NOTE: If you are using the CSV version you just uploaded, change this to .csv and use pd.read_csv below
+CATEGORY_FILE = "category_map_fully_enriched.xlsx" 
 
 # ----------------------
 # INIT DB
@@ -42,39 +43,29 @@ def load_model():
 model = load_model()
 
 # ----------------------
-# LOAD CATEGORY DATA (FIXED)
+# LOAD CATEGORY DATA (100% FIXED FOR YOUR EXACT FILE)
 # ----------------------
 @st.cache_data
 def load_data():
+    # If using the CSV you just uploaded, change this to pd.read_csv(CATEGORY_FILE)
     df = pd.read_excel(CATEGORY_FILE)
     
-    # Standardize column names to lowercase to prevent case-sensitive errors
-    cols_lower = df.columns.str.lower()
-    df.columns = cols_lower
+    # MAGIC FIX: Make all columns lowercase AND replace spaces with underscores.
+    # "Category Path" becomes "category_path"
+    df.columns = df.columns.str.lower().str.strip().str.replace(' ', '_')
 
-    # Dynamically find the category column (looks for 'category_path' or 'category')
-    if "category_path" in cols_lower:
-        cat_col = "category_path"
-    elif "category" in cols_lower:
-        cat_col = "category"
-    else:
-        st.error("Could not find a 'category' column in the Excel file!")
-        st.stop()
-
-    if "category_code" not in cols_lower:
+    # Ensure we have the code column
+    if "category_code" not in df.columns:
         df["category_code"] = df.index.astype(str)
 
-    # Safely get keywords if they exist, otherwise use empty strings
-    if "enriched_keywords" in cols_lower:
+    # Safely get keywords
+    if "enriched_keywords" in df.columns:
         keywords = df["enriched_keywords"].fillna("").astype(str)
     else:
         keywords = ""
 
     # Create the text for the vector embeddings
-    df["category_text"] = df[cat_col].astype(str) + " " + keywords
-    
-    # Standardize the output so the rest of your app doesn't break
-    df["category_path"] = df[cat_col]
+    df["category_text"] = df["category_path"].astype(str) + " " + keywords
     
     return df
 
@@ -109,7 +100,7 @@ if os.path.exists(CATEGORY_FILE):
     learn_df = get_learning()
 
     # ----------------------
-    # MATCH FUNCTION (FIXED KEYWORDS)
+    # MATCH FUNCTION
     # ----------------------
     def match_query(query):
         q = str(query).lower()
@@ -172,7 +163,7 @@ if os.path.exists(CATEGORY_FILE):
             st.success("Learned ✅")
 
     # ----------------------
-    # BULK MATCH (FIXED SEPARATOR)
+    # BULK MATCH
     # ----------------------
     st.divider()
     st.subheader("📂 Bulk Matching")
@@ -180,7 +171,7 @@ if os.path.exists(CATEGORY_FILE):
     bulk_file = st.file_uploader("Upload CSV", type=["csv"])
 
     if bulk_file:
-        # Try reading with semicolon first, fallback to comma
+        # Tries semicolon separator first (for the CSV you uploaded earlier), then comma
         try:
             bulk_df = pd.read_csv(bulk_file, sep=";")
             if len(bulk_df.columns) == 1:
@@ -195,7 +186,6 @@ if os.path.exists(CATEGORY_FILE):
         results = []
 
         if col:
-            # We want to show a progress bar because processing hundreds of rows takes time
             progress_bar = st.progress(0)
             status_text = st.empty()
             total_items = len(bulk_df)
@@ -217,7 +207,7 @@ if os.path.exists(CATEGORY_FILE):
             status_text.text("Processing Complete! ✅")
 
             out_df = pd.DataFrame(results)
-            st.dataframe(out_df.head(50)) # Only show first 50 to avoid lagging the browser
+            st.dataframe(out_df.head(50)) 
 
             # ----------------------
             # ANALYTICS
@@ -241,4 +231,4 @@ if os.path.exists(CATEGORY_FILE):
             st.error("No product name column found. Found columns: " + ", ".join(bulk_df.columns))
 
 else:
-    st.error("`category_map_fully_enriched.xlsx` not found in the current folder. Please upload it beside this script.")
+    st.error(f"`{CATEGORY_FILE}` not found in the current folder. Please ensure the file is named exactly like this and is in the same folder as the script.")
