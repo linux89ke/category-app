@@ -6,3 +6,4 @@ torch
 torchvision
 faiss-cpu
 openpyxl
+rapidfuzz
