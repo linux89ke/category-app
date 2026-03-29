@@ -10,8 +10,8 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 # ==========================================
 # 1. SETUP & CONFIGURATION
 # ==========================================
-st.set_page_config(page_title="Deep Match Comparison", layout="wide")
-st.title("🔎 Category Comparison (Code-Mapped)")
+st.set_page_config(page_title="Global Deep Match Engine", layout="wide")
+st.title("🔎 Category Matcher (Global Deep Search)")
 
 DB_PATH = "learning.db"
 CATEGORY_FILE = "category_map_fully_enriched.xlsx" 
@@ -37,42 +37,40 @@ def load_hierarchical_data():
         st.stop()
         
     df = pd.read_excel(CATEGORY_FILE)
-    # Ensure standard column names
     df.columns = df.columns.str.lower().str.strip().str.replace(' ', '_')
     
     # Calculate path depth
     df['depth'] = df['category_path'].apply(lambda x: str(x).count('/') + 1)
-    df['tlc'] = df['category_path'].apply(lambda x: str(x).split('/')[0].strip())
     df['search_text'] = (df['category_path'].astype(str) + " " + df['enriched_keywords'].fillna("")).str.lower()
     
     # Create a Master Dictionary: Code -> Full Path
     code_to_path_map = dict(zip(df['category_code'].astype(str), df['category_path']))
     
-    tlc_list = df['tlc'].unique().tolist()
-    return df, tlc_list, code_to_path_map
+    return df, code_to_path_map
 
-df_main, tlc_list, master_code_map = load_hierarchical_data()
+df_main, master_code_map = load_hierarchical_data()
+search_text_list = df_main['search_text'].tolist() # Cached for speed
 
 # ==========================================
-# 4. MATCHING ENGINE
+# 4. GLOBAL MATCHING ENGINE (The Fix)
 # ==========================================
 def match_single_item(product_name, threshold, learned_dict, row_index):
     original_query = str(product_name).lower().strip()
     clean_query = clean_product_name(product_name)
     
+    # 1. Manual Override Check
     if learned_dict and original_query in learned_dict:
         return (row_index, learned_dict[original_query][0], learned_dict[original_query][1], 100.0, "✅ Approved")
 
-    best_tlc = process.extractOne(clean_query, tlc_list, scorer=fuzz.token_set_ratio)[0]
-    
-    sub_df = df_main[df_main['tlc'] == best_tlc].copy()
-    candidates = process.extract(clean_query, sub_df['search_text'].tolist(), scorer=fuzz.token_set_ratio, limit=5)
+    # 2. GLOBAL SEARCH: Grab the Top 10 best matches across the ENTIRE catalog
+    candidates = process.extract(clean_query, search_text_list, scorer=fuzz.token_set_ratio, limit=10)
     
     best_final_score = -1
     best_match_data = ("Uncategorized", None, 0.0)
 
+    # 3. Apply Depth Bonus to find the best specific category
     for match_str, base_score, local_idx in candidates:
-        candidate_row = sub_df.iloc[local_idx]
+        candidate_row = df_main.iloc[local_idx]
         depth_bonus = candidate_row['depth'] * 2.0 
         final_score = base_score + depth_bonus
         
@@ -103,19 +101,15 @@ if uploaded_file:
 
     # AUTO-DETECT COLUMNS
     col_name = "NAME" if "NAME" in df_up.columns else next((c for c in df_up.columns if "NAME" in c.upper()), df_up.columns[0])
-    # Find the Code column in the uploaded file
     code_col = next((c for c in df_up.columns if "CODE" in c.upper() and "MATCHED" not in c.upper()), None)
 
     st.info(f"Analyzing Names from: **{col_name}**")
     
     if code_col:
         st.success(f"Original Code detected in: **{code_col}**")
-        # --- TRANSLATE UPLOADED CODE TO FULL PATH ---
         df_up["Assigned Full Path"] = df_up[code_col].astype(str).map(master_code_map).fillna("⚠️ Code Not Found in Taxonomy")
-    else:
-        st.warning("No 'Code' column detected in your upload. Cannot map original category.")
 
-    if st.button("Start Comparison Analysis 🚀"):
+    if st.button("Start Global Analysis 🚀"):
         conn = sqlite3.connect(DB_PATH)
         try:
             l_df = pd.read_sql("SELECT * FROM feedback", conn)
@@ -153,10 +147,18 @@ if uploaded_file:
         # Build Display Columns
         display_cols = [col_name]
         if code_col:
-            display_cols.append("Assigned Full Path")  # Shows the full level path decoded from the code
+            display_cols.append("Assigned Full Path")
         display_cols += ["Status", "AI Matched Category", "Confidence Score"]
 
         st.subheader("Side-by-Side Comparison")
         st.dataframe(final_df[display_cols].head(500), use_container_width=True)
         
         st.download_button("📥 Download Analysis CSV", final_df.to_csv(index=False).encode('utf-8'), "category_comparison.csv")
+
+# ==========================================
+# 6. SIDEBAR STATS
+# ==========================================
+st.sidebar.divider()
+if st.sidebar.button("Clear Cache"):
+    st.cache_data.clear()
+    st.rerun()
