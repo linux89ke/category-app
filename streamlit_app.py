@@ -2,13 +2,13 @@ import streamlit as st
 import pandas as pd
 import sqlite3
 import os
-from rapidfuzz import fuzz, utils
+from rapidfuzz import fuzz
 
 # ==========================================
 # 1. SETUP & CONFIGURATION
 # ==========================================
 st.set_page_config(page_title="E-commerce Category Matcher", layout="wide")
-st.title("🛒 High-Speed Category Matcher")
+st.title("🛒 Smart Category Matcher (AI-Free & Fast)")
 
 DB_PATH = "learning.db"
 CATEGORY_FILE = "category_map_fully_enriched.xlsx" 
@@ -33,7 +33,7 @@ def init_db():
 init_db()
 
 # ==========================================
-# 3. CATEGORY MATCHER LOGIC (Optimized)
+# 3. CATEGORY MATCHER LOGIC
 # ==========================================
 class EcommerceCategoryMatcher:
     def __init__(self, taxonomy_df):
@@ -42,25 +42,24 @@ class EcommerceCategoryMatcher:
         self.taxonomy = taxonomy_df["category_path"].tolist()
         self.taxonomy_clean = [str(c).lower().replace(">", " ").replace("&", " ") for c in self.taxonomy]
 
-    def match(self, product_title, min_score=0.25, learned_dict=None):
+    def match(self, product_title, threshold=45, learned_dict=None):
         if not product_title or not isinstance(product_title, str):
-            return "Uncategorized", None, 0.0
+            return "Uncategorized", None, 0.0, "❌ Rejected"
 
         query = str(product_title).lower()
         
-        # 1. Instant Learning Check
+        # 1. Instant Learning Check (Manual Overrides)
         if learned_dict and query in learned_dict:
-            return learned_dict[query][0], learned_dict[query][1], 1.0
+            return learned_dict[query][0], learned_dict[query][1], 1.0, "✅ Approved"
 
         best_match_path = "Uncategorized"
         highest_score = 0.0
         best_idx = -1
-
         query_set = set(query.split())
 
-        # 2. Optimized Loop
+        # 2. High-Speed Fuzzy Loop
         for idx, cat_normalized in enumerate(self.taxonomy_clean):
-            # Fast Fuzzy Similarity (Ratio)
+            # RapidFuzz Ratio
             similarity = fuzz.ratio(query, cat_normalized) / 100.0
             
             # Word Overlap
@@ -68,18 +67,26 @@ class EcommerceCategoryMatcher:
             intersection = query_set.intersection(cat_set)
             overlap_score = (len(intersection) / len(cat_set)) if cat_set else 0
             
-            # Final Weighted Score
+            # Weighted Final Score (40% Fuzzy, 60% Overlap)
             final_score = (similarity * 0.4) + (overlap_score * 0.6)
             
             if final_score > highest_score:
                 highest_score = final_score
                 best_idx = idx
 
-        if highest_score < min_score:
-            return "Uncategorized", None, round(highest_score, 2)
+        # Convert to 100-based scale
+        final_score_pct = round(min(highest_score, 1.0) * 100, 2)
+        
+        if final_score_pct < threshold:
+            status = "❌ Rejected"
+        else:
+            status = "✅ Approved"
 
-        best_row = self.df.iloc[best_idx]
-        return best_row["category_path"], best_row["category_code"], round(min(highest_score, 1.0), 2)
+        if best_idx != -1:
+            best_row = self.df.iloc[best_idx]
+            return best_row["category_path"], best_row["category_code"], final_score_pct, status
+        
+        return "Uncategorized", None, final_score_pct, "❌ Rejected"
 
 # ==========================================
 # 4. DATA LOADING
@@ -87,7 +94,7 @@ class EcommerceCategoryMatcher:
 @st.cache_data
 def load_taxonomy():
     if not os.path.exists(CATEGORY_FILE):
-        st.error(f"❌ `{CATEGORY_FILE}` not found.")
+        st.error(f"❌ `{CATEGORY_FILE}` not found in the directory.")
         st.stop()
     tdf = pd.read_excel(CATEGORY_FILE)
     tdf.columns = tdf.columns.str.lower().str.strip().str.replace(' ', '_')
@@ -99,74 +106,95 @@ taxonomy_df = load_taxonomy()
 matcher = EcommerceCategoryMatcher(taxonomy_df)
 
 # ==========================================
-# 5. UI TABS
+# 5. SIDEBAR SETTINGS
+# ==========================================
+st.sidebar.header("⚙️ Configuration")
+threshold = st.sidebar.slider("Auto-Approval Threshold", 0, 100, 45, help="Scores below this will be marked 'Rejected'")
+st.sidebar.divider()
+st.sidebar.metric("Categories Loaded", len(taxonomy_df))
+
+# ==========================================
+# 6. UI TABS
 # ==========================================
 tab1, tab2 = st.tabs(["Single Match", "Batch Match (CSV)"])
 
 with tab1:
-    st.header("Single Product Matcher")
-    product_input = st.text_input("Enter Product Title:", placeholder="e.g., iPhone 16 Pro Max")
-    if st.button("Match Category"):
+    st.header("Single Matcher")
+    product_input = st.text_input("Enter Product Title:")
+    if st.button("Analyze Product"):
         if product_input:
-            cat, code, score = matcher.match(product_input)
-            st.success(f"**Category:** {cat} | **Score:** {score}")
+            cat, code, score, status = matcher.match(product_input, threshold=threshold)
+            if status == "✅ Approved":
+                st.success(f"**Status:** {status} | **Category:** {cat} | **Score:** {score}")
+            else:
+                st.warning(f"**Status:** {status} | **Best Guess:** {cat} | **Score:** {score}")
         else:
             st.warning("Please enter a title.")
 
 with tab2:
     st.header("Batch Matcher")
-    uploaded_file = st.file_uploader("Upload CSV", type="csv")
+    uploaded_file = st.file_uploader("Upload CSV File", type="csv")
 
     if uploaded_file is not None:
         try:
+            # Handle different separators
             df_upload = pd.read_csv(uploaded_file, sep=";", on_bad_lines='skip')
             if len(df_upload.columns) == 1:
                 uploaded_file.seek(0)
                 df_upload = pd.read_csv(uploaded_file, sep=",", on_bad_lines='skip')
         except Exception as e:
-            st.error(f"Read Error: {e}"); st.stop()
+            st.error(f"File Load Error: {e}"); st.stop()
 
-        # --- AUTOMATIC COLUMN DETECTION ---
-        auto_col = next((c for c in df_upload.columns if c.upper() in ["NAME", "PRODUCT_NAME", "TITLE", "PRODUCT"]), df_upload.columns[0])
-        st.info(f"Using column: **{auto_col}**")
+        # AUTO-DETECT COLUMN
+        valid_cols = [c for c in df_upload.columns if any(x in c.upper() for x in ["NAME", "PRODUCT", "TITLE"])]
+        auto_col = valid_cols[0] if valid_cols else df_upload.columns[0]
+        st.info(f"Automatically using column: **{auto_col}**")
 
-        if st.button("Process Batch"):
-            # Load learned data into memory for speed
+        if st.button("Run Batch Process"):
+            # Load learning DB into memory
             conn = sqlite3.connect(DB_PATH)
             l_df = pd.read_sql("SELECT * FROM feedback", conn)
             conn.close()
             learned_dict = {row['query']: (row['correct_category'], row['category_code']) for _, row in l_df.iterrows()}
 
-            # Setup Progress Bar
+            # Progress Tracking
             progress_bar = st.progress(0)
             status_text = st.empty()
             
-            results_cat, results_code, results_score = [], [], []
-            total = len(df_upload)
+            results = []
+            total_rows = len(df_upload)
             
             for i, val in enumerate(df_upload[auto_col]):
-                cat, code, score = matcher.match(str(val), learned_dict=learned_dict)
-                results_cat.append(cat)
-                results_code.append(code)
-                results_score.append(score)
+                res = matcher.match(str(val), threshold=threshold, learned_dict=learned_dict)
+                results.append({
+                    "Product Name": val,
+                    "Status": res[3],
+                    "Matched Category": res[0],
+                    "Category Code": res[1],
+                    "Confidence Score": res[2]
+                })
                 
-                # Update progress every 20 rows to keep UI snappy
+                # Update progress bar
                 if i % 20 == 0:
-                    progress_bar.progress((i + 1) / total)
-                    status_text.text(f"Processing row {i+1} of {total}...")
+                    progress_bar.progress((i + 1) / total_rows)
+                    status_text.text(f"Matching row {i+1} of {total_rows}...")
 
-            df_upload['Matched Category'] = results_cat
-            df_upload['Category Code'] = results_code
-            df_upload['Confidence Score'] = results_score
-            
+            out_df = pd.DataFrame(results)
             progress_bar.progress(1.0)
             status_text.text("Processing Complete! ✅")
             
-            st.dataframe(df_upload.head(100))
-            st.download_button("📥 Download Results", df_upload.to_csv(index=False).encode('utf-8'), "results.csv")
+            # Display stats
+            c1, c2, c3 = st.columns(3)
+            c1.metric("Total Items", len(out_df))
+            c2.metric("✅ Approved", len(out_df[out_df["Status"] == "✅ Approved"]))
+            c3.metric("❌ Rejected", len(out_df[out_df["Status"] == "❌ Rejected"]))
 
-# ==========================================
-# 6. SIDEBAR
-# ==========================================
-st.sidebar.header("Taxonomy")
-st.sidebar.metric("Categories Loaded", len(taxonomy_df))
+            st.dataframe(out_df, use_container_width=True)
+            
+            # Download
+            st.download_button(
+                "📥 Download Categorized CSV", 
+                out_df.to_csv(index=False).encode('utf-8'), 
+                "categorized_results.csv",
+                "text/csv"
+            )
