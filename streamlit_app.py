@@ -1,18 +1,21 @@
 import streamlit as st
 import pandas as pd
+import numpy as np
 import sqlite3
+import pickle
 import os
-from sklearn.feature_extraction.text import TfidfVectorizer
-from sklearn.metrics.pairwise import linear_kernel
+from sentence_transformers import SentenceTransformer
+import faiss
 
 # ==========================================
 # 1. SETUP & CONFIGURATION
 # ==========================================
 st.set_page_config(page_title="Category Matching Engine", layout="wide")
-st.title("⚡ Category Engine (Matrix Math + Learning)")
+st.title("🧠 Category Engine (Semantic AI + FAISS)")
 
 DB_PATH = "learning.db"
-CATEGORY_FILE = "category_map_fully_enriched.xlsx" 
+CATEGORY_FILE = "category_map_fully_enriched.xlsx"
+PROCESSED_DATA_FILE = "category_map_with_embeddings.pkl"
 
 # ==========================================
 # 2. INITIALIZE DATABASE
@@ -34,15 +37,28 @@ def init_db():
 init_db()
 
 # ==========================================
-# 3. LOAD DATA & BUILD MATRIX ENGINE
+# 3. LOAD AI MODEL
 # ==========================================
-@st.cache_data
-def load_data():
+@st.cache_resource
+def load_model():
+    # This AI model understands context and meaning, not just spelling!
+    return SentenceTransformer('all-MiniLM-L6-v2')
+
+model = load_model()
+
+# ==========================================
+# 4. LOAD DATA & BUILD AI INDEX
+# ==========================================
+# We use Pickle to save the AI's math so it loads instantly after the first run
+if os.path.exists(PROCESSED_DATA_FILE):
+    with open(PROCESSED_DATA_FILE, "rb") as f:
+        df = pickle.load(f)
+else:
     if not os.path.exists(CATEGORY_FILE):
-        st.error(f"❌ File not found: `{CATEGORY_FILE}`. Please ensure it is in the same folder as this script.")
-        st.write("📂 Files Python can see in this folder:", os.listdir())
+        st.error(f"❌ File not found: `{CATEGORY_FILE}`.")
         st.stop()
         
+    st.info("First run detected! Crunching AI embeddings... this will take a minute but will be instant next time.")
     df = pd.read_excel(CATEGORY_FILE)
     df.columns = df.columns.str.lower().str.strip().str.replace(' ', '_')
 
@@ -52,26 +68,29 @@ def load_data():
     keywords = df["enriched_keywords"].fillna("").astype(str) if "enriched_keywords" in df.columns else ""
     df["search_text"] = df["category_path"].astype(str) + " " + keywords
     
-    return df
+    # Calculate embeddings
+    embeddings = model.encode(df["search_text"].tolist(), convert_to_numpy=True)
+    df["embedding"] = list(embeddings)
+    
+    with open(PROCESSED_DATA_FILE, "wb") as f:
+        pickle.dump(df, f)
+    st.success("✅ Embeddings saved!")
 
-@st.cache_resource
-def build_search_engine(dataframe):
-    # This acts like fuzzy matching by breaking words into 3-4 letter chunks
-    vectorizer = TfidfVectorizer(analyzer='char_wb', ngram_range=(3, 4))
-    tfidf_matrix = vectorizer.fit_transform(dataframe["search_text"])
-    return vectorizer, tfidf_matrix
+# Build FAISS Vector Database for instant searching
+embeddings_matrix = np.vstack(df["embedding"].values).astype('float32')
+faiss.normalize_L2(embeddings_matrix)
 
-df = load_data()
-vectorizer, tfidf_matrix = build_search_engine(df)
-st.success("High-Speed Matrix Engine Ready ⚡")
+index = faiss.IndexFlatIP(embeddings_matrix.shape[1])
+index.add(embeddings_matrix)
+
+st.success("AI Vector Database Ready ⚡")
 
 # ==========================================
-# 4. APP SETTINGS & LEARNING DATA
+# 5. APP SETTINGS & LEARNING DATA
 # ==========================================
 st.sidebar.header("⚙️ Settings")
-# Note: TF-IDF scores slightly differently than RapidFuzz. 
-# You might need to adjust this threshold. Usually, 30-50 is a good strict cutoff.
-threshold = st.sidebar.slider("Auto-reject threshold", 0, 100, 35)
+# AI scores differently. 40-50 is usually a great threshold for semantic search.
+threshold = st.sidebar.slider("Auto-reject threshold", 0, 100, 45)
 
 def get_learning():
     conn = sqlite3.connect(DB_PATH)
@@ -82,7 +101,7 @@ def get_learning():
 learn_df = get_learning()
 
 # ==========================================
-# 5. CORE MATCHING LOGIC (Single)
+# 6. CORE MATCHING LOGIC (Single)
 # ==========================================
 def match_query(query):
     q = str(query).lower()
@@ -92,12 +111,13 @@ def match_query(query):
         row = learned.iloc[-1]
         return "✅ Approved", row["correct_category"], row["category_code"], 100.0
 
-    # Fast Matrix Math for single item
-    q_vec = vectorizer.transform([q])
-    cosine_similarities = linear_kernel(q_vec, tfidf_matrix).flatten()
-    
-    best_idx = cosine_similarities.argmax()
-    score = cosine_similarities[best_idx] * 100 # Convert to percentage
+    # Semantic Vector Search
+    q_emb = model.encode([q], convert_to_numpy=True).astype('float32')
+    faiss.normalize_L2(q_emb)
+
+    scores, indices = index.search(q_emb, 1) # Get top 1 match
+    best_idx = indices[0][0]
+    score = scores[0][0] * 100 # Convert cosine similarity to percentage
     
     best_row = df.iloc[best_idx]
     
@@ -106,10 +126,9 @@ def match_query(query):
     return status, best_row["category_path"], best_row["category_code"], score
 
 # ==========================================
-# 6. INSTANT BATCH LOGIC
+# 7. HIGH-SPEED BATCH LOGIC
 # ==========================================
 def batch_match_queries(queries):
-    # Prepare an empty list to keep original CSV order
     results = [{"Product Name": q, "Status": "❌ Rejected", "Full Category Path": None, "Category Code": None, "Score": 0.0} for q in queries]
     
     learned_dict = {row["query"]: (row["correct_category"], row["category_code"]) for _, row in learn_df.iterrows()}
@@ -117,7 +136,6 @@ def batch_match_queries(queries):
     unseen_queries = []
     unseen_indices = []
     
-    # Check what we already learned
     for i, q in enumerate(queries):
         if pd.isna(q) or str(q).strip() == "":
             results[i]["Status"] = "⚠️ Empty"
@@ -134,23 +152,25 @@ def batch_match_queries(queries):
             unseen_queries.append(q_lower)
             unseen_indices.append(i)
             
-    # BLAZING FAST MATH: Calculate everything else instantly
+    # BATCH AI PROCESSING (Incredibly fast)
     if unseen_queries:
-        q_vecs = vectorizer.transform(unseen_queries)
-        cosine_similarities = linear_kernel(q_vecs, tfidf_matrix)
+        # Batch encode 64 items at a time
+        q_embs = model.encode(unseen_queries, batch_size=64, convert_to_numpy=True).astype('float32')
+        faiss.normalize_L2(q_embs)
         
-        best_indices = cosine_similarities.argmax(axis=1)
-        best_scores = cosine_similarities.max(axis=1) * 100
+        # Batch search FAISS database
+        all_scores, all_indices = index.search(q_embs, 1)
         
-        for idx, best_idx, score in zip(unseen_indices, best_indices, best_scores):
+        for idx, best_idx_array, score_array in zip(unseen_indices, all_indices, all_scores):
+            best_idx = best_idx_array[0]
+            score = score_array[0] * 100
+            
             best_row = df.iloc[best_idx]
             
-            # Set the values
             results[idx]["Score"] = round(score, 2)
             results[idx]["Full Category Path"] = best_row["category_path"]
             results[idx]["Category Code"] = best_row["category_code"]
             
-            # Assign Status
             if score < threshold:
                 results[idx]["Status"] = "❌ Rejected"
             else:
@@ -159,7 +179,7 @@ def batch_match_queries(queries):
     return results
 
 # ==========================================
-# 7. UI: SINGLE MATCH
+# 8. UI: SINGLE MATCH
 # ==========================================
 st.subheader("🔍 Single Match")
 query = st.text_input("Enter product name")
@@ -184,7 +204,7 @@ if query:
             st.success("Learned! ✅ Next time you search this, it will be 100% accurate.")
 
 # ==========================================
-# 8. UI: BULK MATCHING
+# 9. UI: BULK MATCHING
 # ==========================================
 st.divider()
 st.subheader("📂 Bulk Batch Processing")
@@ -192,7 +212,7 @@ st.subheader("📂 Bulk Batch Processing")
 bulk_file = st.file_uploader("Upload Product CSV", type=["csv"])
 
 if bulk_file:
-    # --- UPDATED: on_bad_lines='skip' to prevent crashing on broken rows ---
+    # Handle files with bad lines/mixed separators
     try:
         bulk_df = pd.read_csv(bulk_file, sep=";", on_bad_lines='skip')
         if len(bulk_df.columns) == 1:
@@ -201,7 +221,6 @@ if bulk_file:
     except Exception as e:
         st.error(f"Error reading CSV: {e}")
         st.stop()
-    # ------------------------------------------------------------------------
 
     # SMART COLUMN DETECTION - STRICTLY LOOKS FOR 'NAME'
     if "NAME" in bulk_df.columns:
@@ -213,9 +232,9 @@ if bulk_file:
 
     if col:
         st.info(f"Detected product column: `{col}` ({len(bulk_df)} items)")
-        if st.button("Start High-Speed Process"):
+        if st.button("Start AI Batch Process"):
             
-            with st.spinner(f"Running Matrix Math on {len(bulk_df)} items... ⚡"):
+            with st.spinner(f"Running AI Context Engine on {len(bulk_df)} items... 🧠⚡"):
                 queries_list = bulk_df[col].tolist()
                 results = batch_match_queries(queries_list)
 
@@ -223,13 +242,12 @@ if bulk_file:
 
             out_df = pd.DataFrame(results)
             
-            # Make the table look nice in Streamlit
             st.dataframe(
                 out_df.head(100),
                 column_config={
                     "Score": st.column_config.ProgressColumn(
                         "Score",
-                        help="Confidence Score",
+                        help="AI Confidence Score",
                         format="%f",
                         min_value=0,
                         max_value=100,
@@ -245,9 +263,9 @@ if bulk_file:
             col1, col2, col3 = st.columns(3)
             col1.metric("Total Processed", total)
             col2.metric("✅ Approved", approved)
-            col3.metric("❌ Rejected (Needs Review)", rejected)
+            col3.metric("❌ Rejected", rejected)
 
             csv_data = out_df.to_csv(index=False).encode('utf-8')
-            st.download_button("📥 Download Matched Results", csv_data, "categorized_products.csv", "text/csv")
+            st.download_button("📥 Download Matched Results", csv_data, "ai_categorized_products.csv", "text/csv")
     else:
         st.error("No product name column found.")
