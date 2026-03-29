@@ -192,15 +192,18 @@ st.subheader("📂 Bulk Batch Processing")
 bulk_file = st.file_uploader("Upload Product CSV", type=["csv"])
 
 if bulk_file:
+    # --- UPDATED: on_bad_lines='skip' to prevent crashing on broken rows ---
     try:
-        bulk_df = pd.read_csv(bulk_file, sep=";")
+        bulk_df = pd.read_csv(bulk_file, sep=";", on_bad_lines='skip')
         if len(bulk_df.columns) == 1:
             bulk_file.seek(0)
-            bulk_df = pd.read_csv(bulk_file, sep=",")
+            bulk_df = pd.read_csv(bulk_file, sep=",", on_bad_lines='skip')
     except Exception as e:
         st.error(f"Error reading CSV: {e}")
         st.stop()
+    # ------------------------------------------------------------------------
 
+    # SMART COLUMN DETECTION - STRICTLY LOOKS FOR 'NAME'
     if "NAME" in bulk_df.columns:
         col = "NAME"
     elif "name" in bulk_df.columns:
