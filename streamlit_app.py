@@ -11,7 +11,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 # 1. SETUP & CONFIGURATION
 # ==========================================
 st.set_page_config(page_title="Deep Match Comparison", layout="wide")
-st.title("🔎 Category Comparison & Matching Engine")
+st.title("🔎 Category Comparison (Code-Mapped)")
 
 DB_PATH = "learning.db"
 CATEGORY_FILE = "category_map_fully_enriched.xlsx" 
@@ -22,14 +22,13 @@ CATEGORY_FILE = "category_map_fully_enriched.xlsx"
 def clean_product_name(text):
     if not isinstance(text, str): return ""
     text = text.lower()
-    # Remove measurements and quantity noise
     text = re.sub(r'\d+\s*(ml|g|kg|units|tablets|pcs|capsules|oz|s|count|ct|units)\b', '', text)
     text = re.sub(r'[^a-zA-Z0-9\s]', ' ', text)
     text = re.sub(r'\b(free shipping|best price|new|promo|original|authentic|pack of|dozen|strong|instant)\b', '', text)
     return " ".join(text.split())
 
 # ==========================================
-# 3. DATA LOADING (Hierarchical + Depth)
+# 3. DATA LOADING & MAPPING
 # ==========================================
 @st.cache_data
 def load_hierarchical_data():
@@ -37,41 +36,36 @@ def load_hierarchical_data():
         st.error(f"❌ `{CATEGORY_FILE}` not found.")
         st.stop()
         
-    # Read the taxonomy (Master categories)
     df = pd.read_excel(CATEGORY_FILE)
+    # Ensure standard column names
     df.columns = df.columns.str.lower().str.strip().str.replace(' ', '_')
     
-    # Calculate path depth (Automobile / Car / Wax = 3)
+    # Calculate path depth
     df['depth'] = df['category_path'].apply(lambda x: str(x).count('/') + 1)
-    
-    # Department Level (Level 1)
     df['tlc'] = df['category_path'].apply(lambda x: str(x).split('/')[0].strip())
-    
-    # Combine Path + Keywords for the AI to "read"
     df['search_text'] = (df['category_path'].astype(str) + " " + df['enriched_keywords'].fillna("")).str.lower()
     
+    # Create a Master Dictionary: Code -> Full Path
+    code_to_path_map = dict(zip(df['category_code'].astype(str), df['category_path']))
+    
     tlc_list = df['tlc'].unique().tolist()
-    return df, tlc_list
+    return df, tlc_list, code_to_path_map
 
-df_main, tlc_list = load_hierarchical_data()
+df_main, tlc_list, master_code_map = load_hierarchical_data()
 
 # ==========================================
-# 4. MATCHING ENGINE WITH DEPTH BIAS
+# 4. MATCHING ENGINE
 # ==========================================
 def match_single_item(product_name, threshold, learned_dict, row_index):
     original_query = str(product_name).lower().strip()
     clean_query = clean_product_name(product_name)
     
-    # 1. Check Learning Database
     if learned_dict and original_query in learned_dict:
         return (row_index, learned_dict[original_query][0], learned_dict[original_query][1], 100.0, "✅ Approved")
 
-    # 2. Step 1: Identify Department (TLC)
-    best_tlc = process.extractOne(clean_query, tlc_list, scorer=fuzz.token_set_ratio)
-    winning_tlc = best_tlc[0]
+    best_tlc = process.extractOne(clean_query, tlc_list, scorer=fuzz.token_set_ratio)[0]
     
-    # 3. Step 2: Deep Match with Depth Bonus (favoring Level 4-6)
-    sub_df = df_main[df_main['tlc'] == winning_tlc].copy()
+    sub_df = df_main[df_main['tlc'] == best_tlc].copy()
     candidates = process.extract(clean_query, sub_df['search_text'].tolist(), scorer=fuzz.token_set_ratio, limit=5)
     
     best_final_score = -1
@@ -79,8 +73,6 @@ def match_single_item(product_name, threshold, learned_dict, row_index):
 
     for match_str, base_score, local_idx in candidates:
         candidate_row = sub_df.iloc[local_idx]
-        
-        # Depth Bonus: Encourages the engine to go deeper than Level 1 or 2
         depth_bonus = candidate_row['depth'] * 2.0 
         final_score = base_score + depth_bonus
         
@@ -111,15 +103,19 @@ if uploaded_file:
 
     # AUTO-DETECT COLUMNS
     col_name = "NAME" if "NAME" in df_up.columns else next((c for c in df_up.columns if "NAME" in c.upper()), df_up.columns[0])
-    # Find the original category column (e.g. "Category", "Category Path", "Original Cat")
-    orig_cat_col = next((c for c in df_up.columns if any(x in c.upper() for x in ["CAT", "PATH", "ORIGINAL"]) and "MATCHED" not in c.upper()), None)
+    # Find the Code column in the uploaded file
+    code_col = next((c for c in df_up.columns if "CODE" in c.upper() and "MATCHED" not in c.upper()), None)
 
-    st.info(f"Analyzing: **{col_name}**")
-    if orig_cat_col:
-        st.success(f"Original Category detected in: **{orig_cat_col}**")
+    st.info(f"Analyzing Names from: **{col_name}**")
+    
+    if code_col:
+        st.success(f"Original Code detected in: **{code_col}**")
+        # --- TRANSLATE UPLOADED CODE TO FULL PATH ---
+        df_up["Assigned Full Path"] = df_up[code_col].astype(str).map(master_code_map).fillna("⚠️ Code Not Found in Taxonomy")
+    else:
+        st.warning("No 'Code' column detected in your upload. Cannot map original category.")
 
     if st.button("Start Comparison Analysis 🚀"):
-        # Load Manual Overrides
         conn = sqlite3.connect(DB_PATH)
         try:
             l_df = pd.read_sql("SELECT * FROM feedback", conn)
@@ -132,7 +128,6 @@ if uploaded_file:
         results_map = {}
         progress_bar = st.progress(0); status_text = st.empty()
 
-        # Parallel Execution
         with ThreadPoolExecutor() as executor:
             futures = {executor.submit(match_single_item, name, threshold, learned_dict, i): i for i, name in enumerate(names)}
             for i, future in enumerate(as_completed(futures)):
@@ -143,7 +138,7 @@ if uploaded_file:
                     "Matched Code": code,
                     "Confidence Score": score
                 }
-                if i % 10 == 0:
+                if i % 10 == 0 or i == len(names)-1:
                     progress_bar.progress((i + 1) / len(names))
                     status_text.text(f"Crunching: {i+1}/{len(names)}")
 
@@ -155,23 +150,13 @@ if uploaded_file:
         results_df = pd.DataFrame.from_dict(results_map, orient='index')
         final_df = pd.concat([df_up_clean, results_df], axis=1)
 
-        # Create Comparison Table
+        # Build Display Columns
         display_cols = [col_name]
-        if orig_cat_col:
-            display_cols.append(orig_cat_col)
+        if code_col:
+            display_cols.append("Assigned Full Path")  # Shows the full level path decoded from the code
         display_cols += ["Status", "AI Matched Category", "Confidence Score"]
 
         st.subheader("Side-by-Side Comparison")
-        st.write("Review how your original category compares to the AI's deep-path suggestion:")
-        
-        # Display the table (full levels will be visible in the cells)
         st.dataframe(final_df[display_cols].head(500), use_container_width=True)
         
         st.download_button("📥 Download Analysis CSV", final_df.to_csv(index=False).encode('utf-8'), "category_comparison.csv")
-
-# ==========================================
-# 6. SIDEBAR STATS
-# ==========================================
-st.sidebar.divider()
-st.sidebar.metric("Taxonomy Depth Levels", df_main['depth'].max())
-st.sidebar.write("The engine is currently biased to favor Level 4+ matches.")
