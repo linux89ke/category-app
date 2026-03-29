@@ -15,8 +15,8 @@ st.set_page_config(page_title="Category Matching Engine", layout="wide")
 st.title("🧠 Ultimate Category Engine (FAISS + Learning + Analytics)")
 
 DB_PATH = "learning.db"
-# Update this to exactly match the file in your folder
-CATEGORY_FILE = "category_map_fully_enriched.xlsx - Sheet1.csv" 
+# Pointing directly to your Excel file
+CATEGORY_FILE = "category_map_fully_enriched.xlsx" 
 PROCESSED_DATA_FILE = "category_map_with_embeddings.pkl"
 
 # ==========================================
@@ -56,15 +56,17 @@ if os.path.exists(PROCESSED_DATA_FILE):
         df = pickle.load(f)
 else:
     if not os.path.exists(CATEGORY_FILE):
-        st.error(f"❌ File not found: `{CATEGORY_FILE}`. Please upload it to the same folder as this script.")
+        st.error(f"❌ File not found: `{CATEGORY_FILE}`. Please make sure the exact file name is in the same folder as this script.")
+        # Debugging: Show files in the directory so you know what Python sees
+        st.write("Files in current folder:", os.listdir())
         st.stop()
         
     st.info("First run detected! Crunching AI embeddings... this will take a minute but will be instant next time.")
     
-    # Load the raw CSV
-    df = pd.read_csv(CATEGORY_FILE)
+    # Load the raw Excel file (requires 'openpyxl' in requirements.txt)
+    df = pd.read_excel(CATEGORY_FILE)
     
-    # MAGIC FIX: Standardize headers (e.g., "Category Path" -> "category_path")
+    # Standardize headers (e.g., "Category Path" -> "category_path")
     df.columns = df.columns.str.lower().str.strip().str.replace(' ', '_')
 
     # Ensure required columns exist
