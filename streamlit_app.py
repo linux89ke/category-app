@@ -42,16 +42,40 @@ def load_model():
 model = load_model()
 
 # ----------------------
-# LOAD CATEGORY DATA
+# LOAD CATEGORY DATA (FIXED)
 # ----------------------
 @st.cache_data
 def load_data():
     df = pd.read_excel(CATEGORY_FILE)
+    
+    # Standardize column names to lowercase to prevent case-sensitive errors
+    cols_lower = df.columns.str.lower()
+    df.columns = cols_lower
 
-    if "category_code" not in df.columns:
+    # Dynamically find the category column (looks for 'category_path' or 'category')
+    if "category_path" in cols_lower:
+        cat_col = "category_path"
+    elif "category" in cols_lower:
+        cat_col = "category"
+    else:
+        st.error("Could not find a 'category' column in the Excel file!")
+        st.stop()
+
+    if "category_code" not in cols_lower:
         df["category_code"] = df.index.astype(str)
 
-    df["category_text"] = df["category_path"].astype(str) + " " + df.get("enriched_keywords", "")
+    # Safely get keywords if they exist, otherwise use empty strings
+    if "enriched_keywords" in cols_lower:
+        keywords = df["enriched_keywords"].fillna("").astype(str)
+    else:
+        keywords = ""
+
+    # Create the text for the vector embeddings
+    df["category_text"] = df[cat_col].astype(str) + " " + keywords
+    
+    # Standardize the output so the rest of your app doesn't break
+    df["category_path"] = df[cat_col]
+    
     return df
 
 if os.path.exists(CATEGORY_FILE):
@@ -78,22 +102,23 @@ if os.path.exists(CATEGORY_FILE):
     # Load learning
     def get_learning():
         conn = sqlite3.connect(DB_PATH)
-        df = pd.read_sql("SELECT * FROM feedback", conn)
+        learning_df = pd.read_sql("SELECT * FROM feedback", conn)
         conn.close()
-        return df
+        return learning_df
 
     learn_df = get_learning()
 
     # ----------------------
-    # MATCH FUNCTION
+    # MATCH FUNCTION (FIXED KEYWORDS)
     # ----------------------
     def match_query(query):
-        q = query.lower()
+        q = str(query).lower()
 
+        # Check if we already learned this exact product
         learned = learn_df[learn_df["query"] == q]
         if not learned.empty:
             row = learned.iloc[-1]
-            return row["correct_category"], row["category_code"], 100, []
+            return row["correct_category"], row["category_code"], 100.0, []
 
         q_emb = model.encode([q], convert_to_numpy=True).astype('float32')
         faiss.normalize_L2(q_emb)
@@ -102,9 +127,12 @@ if os.path.exists(CATEGORY_FILE):
         candidates = df.iloc[indices[0]].copy()
         candidates["semantic_score"] = scores[0]
 
-        candidates["keyword_score"] = candidates["enriched_keywords"].apply(
-            lambda x: fuzz.token_set_ratio(q, str(x))
-        )
+        # Handle missing keywords safely for RapidFuzz
+        def fuzzy_score(x):
+            return fuzz.token_set_ratio(q, str(x)) if pd.notna(x) else 0
+
+        keyword_col = "enriched_keywords" if "enriched_keywords" in candidates.columns else "category_path"
+        candidates["keyword_score"] = candidates[keyword_col].apply(fuzzy_score)
 
         candidates["final_score"] = (candidates["keyword_score"] * 0.5) + (candidates["semantic_score"] * 100 * 0.5)
 
@@ -144,7 +172,7 @@ if os.path.exists(CATEGORY_FILE):
             st.success("Learned ✅")
 
     # ----------------------
-    # BULK MATCH
+    # BULK MATCH (FIXED SEPARATOR)
     # ----------------------
     st.divider()
     st.subheader("📂 Bulk Matching")
@@ -152,14 +180,27 @@ if os.path.exists(CATEGORY_FILE):
     bulk_file = st.file_uploader("Upload CSV", type=["csv"])
 
     if bulk_file:
-        bulk_df = pd.read_csv(bulk_file)
+        # Try reading with semicolon first, fallback to comma
+        try:
+            bulk_df = pd.read_csv(bulk_file, sep=";")
+            if len(bulk_df.columns) == 1:
+                bulk_file.seek(0)
+                bulk_df = pd.read_csv(bulk_file, sep=",")
+        except Exception as e:
+            st.error(f"Error reading CSV: {e}")
+            st.stop()
 
         col = next((c for c in bulk_df.columns if "name" in c.lower() or "product" in c.lower()), None)
 
         results = []
 
         if col:
-            for q in bulk_df[col].astype(str):
+            # We want to show a progress bar because processing hundreds of rows takes time
+            progress_bar = st.progress(0)
+            status_text = st.empty()
+            total_items = len(bulk_df)
+            
+            for i, q in enumerate(bulk_df[col].astype(str)):
                 match, code, score, candidates = match_query(q)
 
                 results.append({
@@ -168,9 +209,15 @@ if os.path.exists(CATEGORY_FILE):
                     "category_code": code,
                     "score": score
                 })
+                
+                # Update progress bar
+                progress_bar.progress((i + 1) / total_items)
+                status_text.text(f"Processing {i + 1} of {total_items}...")
+
+            status_text.text("Processing Complete! ✅")
 
             out_df = pd.DataFrame(results)
-            st.dataframe(out_df)
+            st.dataframe(out_df.head(50)) # Only show first 50 to avoid lagging the browser
 
             # ----------------------
             # ANALYTICS
@@ -181,16 +228,17 @@ if os.path.exists(CATEGORY_FILE):
             rejected = len(out_df[out_df["category"] == "REJECTED"])
             avg_score = out_df["score"].mean()
 
-            st.metric("Total Products", total)
-            st.metric("Rejected", rejected)
-            st.metric("Avg Score", round(avg_score, 2))
+            col1, col2, col3 = st.columns(3)
+            col1.metric("Total Products", total)
+            col2.metric("Rejected", rejected)
+            col3.metric("Avg Score", round(avg_score, 2))
 
             st.bar_chart(out_df["score"])
 
             csv = out_df.to_csv(index=False).encode('utf-8')
             st.download_button("Download Results", csv, "final_results.csv")
         else:
-            st.error("No product name column found")
+            st.error("No product name column found. Found columns: " + ", ".join(bulk_df.columns))
 
 else:
-    st.error("category_map_fully_enriched.xlsx not found")
+    st.error("`category_map_fully_enriched.xlsx` not found in the current folder. Please upload it beside this script.")
