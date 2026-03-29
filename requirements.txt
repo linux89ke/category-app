@@ -1,1 +1,6 @@
 streamlit
+pandas
+numpy
+rapidfuzz
+sentence-transformers
+faiss-cpu
