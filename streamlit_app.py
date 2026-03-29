@@ -181,7 +181,14 @@ if bulk_file:
         st.error(f"Error reading CSV: {e}")
         st.stop()
 
-    col = next((c for c in bulk_df.columns if "name" in c.lower() or "product" in c.lower()), None)
+    # SMART COLUMN DETECTION - STRICTLY LOOKS FOR 'NAME'
+    if "NAME" in bulk_df.columns:
+        col = "NAME"
+    elif "name" in bulk_df.columns:
+        col = "name"
+    else:
+        # Fallback ignoring IDs and Seller Names
+        col = next((c for c in bulk_df.columns if ("name" in c.lower() or "product" in c.lower()) and "id" not in c.lower() and "seller" not in c.lower()), None)
 
     if col:
         st.info(f"Detected product column: `{col}` ({len(bulk_df)} items)")
