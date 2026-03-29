@@ -11,7 +11,7 @@ import faiss
 # 1. SETUP & CONFIGURATION
 # ==========================================
 st.set_page_config(page_title="Category Matching Engine", layout="wide")
-st.title("🧠 Semantic AI Category Engine")
+st.title("🧠 Semantic AI Category Engine (Cloud Optimized)")
 
 DB_PATH = "learning.db"
 CATEGORY_FILE = "category_map_fully_enriched.xlsx"
@@ -41,52 +41,68 @@ init_db()
 # ==========================================
 @st.cache_resource
 def load_model():
-    # Downloads the 'brain' of the engine
+    # Downloads the 'brain' of the engine - all-MiniLM-L6-v2
     return SentenceTransformer('all-MiniLM-L6-v2')
 
 model = load_model()
 
 # ==========================================
-# 4. LOAD DATA & AI INITIALIZATION
+# 4. LOAD DATA & CHUNKED AI INITIALIZATION
 # ==========================================
 if "initialized" not in st.session_state:
     st.session_state.initialized = False
 
 df = None
 
+# Check if we already have the pre-calculated math file
 if os.path.exists(PROCESSED_DATA_FILE):
     with open(PROCESSED_DATA_FILE, "rb") as f:
         df = pickle.load(f)
     st.session_state.initialized = True
 else:
     if not os.path.exists(CATEGORY_FILE):
-        st.error(f"❌ `{CATEGORY_FILE}` not found. Please upload it to your repository.")
+        st.error(f"❌ `{CATEGORY_FILE}` not found. Please upload the Excel file to your GitHub repository.")
         st.stop()
     
-    st.warning("⚠️ The AI Engine needs to be initialized (First-time setup).")
-    if st.button("🚀 Start AI Initialization (Takes ~2 mins)"):
-        with st.spinner("Crunching AI embeddings... please wait."):
-            df_raw = pd.read_excel(CATEGORY_FILE)
-            df_raw.columns = df_raw.columns.str.lower().str.strip().str.replace(' ', '_')
+    st.warning("⚠️ The AI Engine needs a one-time initialization to understand your categories.")
+    if st.button("🚀 Start AI Initialization"):
+        # 1. Load the Excel
+        df_raw = pd.read_excel(CATEGORY_FILE)
+        df_raw.columns = df_raw.columns.str.lower().str.strip().str.replace(' ', '_')
+        if "category_code" not in df_raw.columns:
+            df_raw["category_code"] = df_raw.index.astype(str)
+        
+        keywords = df_raw["enriched_keywords"].fillna("").astype(str) if "enriched_keywords" in df_raw.columns else ""
+        df_raw["search_text"] = df_raw["category_path"].astype(str) + " " + keywords
+        
+        # 2. Process in Chunks of 500 rows to prevent Streamlit Cloud Timeouts
+        all_embeddings = []
+        texts = df_raw["search_text"].tolist()
+        chunk_size = 500 
+        progress_bar = st.progress(0)
+        status_text = st.empty()
+        
+        for i in range(0, len(texts), chunk_size):
+            batch_texts = texts[i:i + chunk_size]
+            status_text.text(f"AI is crunching math for rows {i} to {i+len(batch_texts)} of {len(texts)}...")
+            
+            # Encode this small chunk
+            batch_encodings = model.encode(batch_texts, show_progress_bar=False)
+            all_embeddings.append(batch_encodings)
+            
+            # Update progress UI so the server knows the app is alive
+            progress_bar.progress(min((i + chunk_size) / len(texts), 1.0))
 
-            if "category_code" not in df_raw.columns:
-                df_raw["category_code"] = df_raw.index.astype(str)
-
-            keywords = df_raw["enriched_keywords"].fillna("").astype(str) if "enriched_keywords" in df_raw.columns else ""
-            df_raw["search_text"] = df_raw["category_path"].astype(str) + " " + keywords
-            
-            # Batch process the whole library
-            embeddings = model.encode(df_raw["search_text"].tolist(), batch_size=32, show_progress_bar=True)
-            df_raw["embedding"] = list(embeddings)
-            
-            with open(PROCESSED_DATA_FILE, "wb") as f:
-                pickle.dump(df_raw, f)
-            
-            df = df_raw
-            st.session_state.initialized = True
-            st.rerun()
+        # 3. Combine and Save to Pickle
+        df_raw["embedding"] = list(np.vstack(all_embeddings))
+        with open(PROCESSED_DATA_FILE, "wb") as f:
+            pickle.dump(df_raw, f)
+        
+        st.success("✅ AI Math Complete! App is restarting...")
+        st.session_state.initialized = True
+        st.rerun()
     else:
-        st.info("Waiting for initialization... Click the button above to start.")
+        st.info("Waiting for initialization. Click the button above to begin.")
         st.stop()
 
 # ==========================================
@@ -103,7 +119,7 @@ st.success("AI Vector Database Ready ⚡")
 # 6. APP SETTINGS & LEARNING DATA
 # ==========================================
 st.sidebar.header("⚙️ Settings")
-threshold = st.sidebar.slider("Auto-reject threshold", 0, 100, 45)
+threshold = st.sidebar.slider("Auto-reject threshold (Confidence)", 0, 100, 45)
 
 def get_learning():
     conn = sqlite3.connect(DB_PATH)
@@ -133,6 +149,7 @@ def batch_match_queries(queries):
             unseen_queries.append(q_lower); unseen_indices.append(i)
             
     if unseen_queries:
+        # Batch encode user queries
         q_embs = model.encode(unseen_queries, batch_size=64, convert_to_numpy=True).astype('float32')
         faiss.normalize_L2(q_embs)
         all_scores, all_indices = index.search(q_embs, 1)
@@ -152,14 +169,24 @@ def batch_match_queries(queries):
 # 8. UI: SINGLE MATCH
 # ==========================================
 st.subheader("🔍 Single Match")
-query = st.text_input("Enter product name")
+query = st.text_input("Enter product name (e.g. 'Mens Perfume')")
 if query:
-    # Use the batch logic for a single query to keep code clean
     res = batch_match_queries([query])[0]
     if "Rejected" in res["Status"]:
-        st.warning(f"❌ Rejected (Score: {res['Score']}) | Best Guess: **{res['Full Category Path']}**")
+        st.warning(f"❌ Rejected (Score: {res['Score']}) | AI Suggestion: **{res['Full Category Path']}**")
     else:
         st.success(f"✅ Approved | **{res['Full Category Path']}** | Score: {res['Score']}")
+
+    with st.expander("Teach the Engine (Override)"):
+        correct = st.text_input("Correct category path")
+        correct_code = st.text_input("Correct category code")
+        if st.button("Save Learning") and correct:
+            conn = sqlite3.connect(DB_PATH)
+            c = conn.cursor()
+            c.execute("INSERT INTO feedback (query, correct_category, category_code) VALUES (?, ?, ?)", (query.lower(), correct, correct_code))
+            conn.commit()
+            conn.close()
+            st.success("Learned! ✅ Next time this product will be 100% accurate.")
 
 # ==========================================
 # 9. UI: BULK MATCHING
@@ -177,17 +204,21 @@ if bulk_file:
     except Exception as e:
         st.error(f"Error reading CSV: {e}"); st.stop()
 
+    # Detect the correct Name column
     col = next((c for c in bulk_df.columns if "NAME" == c.upper() or ("NAME" in c.upper() and "ID" not in c.upper())), None)
 
     if col:
-        st.info(f"Detected column: `{col}`")
-        if st.button("Start AI Processing"):
-            with st.spinner("AI is thinking..."):
+        st.info(f"Detected product column: `{col}`")
+        if st.button("Start AI Batch Processing"):
+            with st.spinner("AI is analyzing meanings and context..."):
                 results = batch_match_queries(bulk_df[col].tolist())
             
             out_df = pd.DataFrame(results)
-            st.dataframe(out_df.head(100), column_config={"Score": st.column_config.ProgressColumn("Score", format="%f", min_value=0, max_value=100)})
+            st.dataframe(
+                out_df.head(100), 
+                column_config={"Score": st.column_config.ProgressColumn("Confidence Score", format="%f", min_value=0, max_value=100)}
+            )
             
-            st.download_button("📥 Download Results", out_df.to_csv(index=False).encode('utf-8'), "ai_results.csv")
+            st.download_button("📥 Download Categorized Results", out_df.to_csv(index=False).encode('utf-8'), "ai_categorized_results.csv")
     else:
-        st.error("No product name column found.")
+        st.error("Could not find a 'NAME' column in your CSV.")
