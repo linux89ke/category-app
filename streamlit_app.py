@@ -2,16 +2,16 @@ import streamlit as st
 import pandas as pd
 import sqlite3
 import os
-from rapidfuzz import fuzz, process
+from sklearn.feature_extraction.text import TfidfVectorizer
+from sklearn.metrics.pairwise import linear_kernel
 
 # ==========================================
 # 1. SETUP & CONFIGURATION
 # ==========================================
 st.set_page_config(page_title="Category Matching Engine", layout="wide")
-st.title("⚡ Category Engine (Fuzzy Logic + Learning)")
+st.title("⚡ Category Engine (Matrix Math + Learning)")
 
 DB_PATH = "learning.db"
-# Make sure this matches your exact Excel file name in the folder
 CATEGORY_FILE = "category_map_fully_enriched.xlsx" 
 
 # ==========================================
@@ -34,7 +34,7 @@ def init_db():
 init_db()
 
 # ==========================================
-# 3. LOAD DATA (High-Speed Text Base)
+# 3. LOAD DATA & BUILD MATRIX ENGINE
 # ==========================================
 @st.cache_data
 def load_data():
@@ -44,31 +44,34 @@ def load_data():
         st.stop()
         
     df = pd.read_excel(CATEGORY_FILE)
-    
-    # Standardize headers to lowercase with underscores
     df.columns = df.columns.str.lower().str.strip().str.replace(' ', '_')
 
-    # Ensure required columns exist
     if "category_code" not in df.columns:
         df["category_code"] = df.index.astype(str)
 
-    # Safely extract keywords
     keywords = df["enriched_keywords"].fillna("").astype(str) if "enriched_keywords" in df.columns else ""
-    
-    # Create the text to match against
     df["search_text"] = df["category_path"].astype(str) + " " + keywords
     
     return df
 
+@st.cache_resource
+def build_search_engine(dataframe):
+    # This acts like fuzzy matching by breaking words into 3-4 letter chunks
+    vectorizer = TfidfVectorizer(analyzer='char_wb', ngram_range=(3, 4))
+    tfidf_matrix = vectorizer.fit_transform(dataframe["search_text"])
+    return vectorizer, tfidf_matrix
+
 df = load_data()
-search_choices = df["search_text"].tolist()
-st.success("System Ready ⚡")
+vectorizer, tfidf_matrix = build_search_engine(df)
+st.success("High-Speed Matrix Engine Ready ⚡")
 
 # ==========================================
 # 4. APP SETTINGS & LEARNING DATA
 # ==========================================
 st.sidebar.header("⚙️ Settings")
-threshold = st.sidebar.slider("Auto-reject threshold", 0, 100, 65)
+# Note: TF-IDF scores slightly differently than RapidFuzz. 
+# You might need to adjust this threshold. Usually, 30-50 is a good strict cutoff.
+threshold = st.sidebar.slider("Auto-reject threshold", 0, 100, 35)
 
 def get_learning():
     conn = sqlite3.connect(DB_PATH)
@@ -84,64 +87,74 @@ learn_df = get_learning()
 def match_query(query):
     q = str(query).lower()
     
-    # 1. Check if we already learned this exact product
     learned = learn_df[learn_df["query"] == q]
     if not learned.empty:
         row = learned.iloc[-1]
-        return row["correct_category"], row["category_code"], 100.0
+        return "✅ Approved", row["correct_category"], row["category_code"], 100.0
 
-    # 2. RapidFuzz Exact/Fuzzy Search using WRatio (better for long strings)
-    result = process.extractOne(q, search_choices, scorer=fuzz.WRatio)
+    # Fast Matrix Math for single item
+    q_vec = vectorizer.transform([q])
+    cosine_similarities = linear_kernel(q_vec, tfidf_matrix).flatten()
     
-    if result:
-        best_match_str, score, best_idx = result
-        best_row = df.iloc[best_idx]
-        
-        if score < threshold:
-            return "REJECTED", None, score
-        else:
-            return best_row["category_path"], best_row["category_code"], score
-            
-    return "REJECTED", None, 0.0
+    best_idx = cosine_similarities.argmax()
+    score = cosine_similarities[best_idx] * 100 # Convert to percentage
+    
+    best_row = df.iloc[best_idx]
+    
+    status = "✅ Approved" if score >= threshold else "❌ Rejected"
+    
+    return status, best_row["category_path"], best_row["category_code"], score
 
 # ==========================================
-# 6. HIGH-SPEED BATCH LOGIC
+# 6. INSTANT BATCH LOGIC
 # ==========================================
-def batch_match_queries(queries, progress_bar, status_text):
-    results = []
-    total = len(queries)
+def batch_match_queries(queries):
+    # Prepare an empty list to keep original CSV order
+    results = [{"Product Name": q, "Status": "❌ Rejected", "Full Category Path": None, "Category Code": None, "Score": 0.0} for q in queries]
     
-    # Pre-load learned dictionary for instant lookups
     learned_dict = {row["query"]: (row["correct_category"], row["category_code"]) for _, row in learn_df.iterrows()}
     
+    unseen_queries = []
+    unseen_indices = []
+    
+    # Check what we already learned
     for i, q in enumerate(queries):
         if pd.isna(q) or str(q).strip() == "":
+            results[i]["Status"] = "⚠️ Empty"
             continue
             
         q_lower = str(q).lower()
-        
-        # Check dictionary first
         if q_lower in learned_dict:
             cat, code = learned_dict[q_lower]
-            results.append({"product": q, "category": cat, "category_code": code, "score": 100.0})
+            results[i]["Status"] = "✅ Approved"
+            results[i]["Full Category Path"] = cat
+            results[i]["Category Code"] = code
+            results[i]["Score"] = 100.0
         else:
-            # CHANGED TO WRatio: Much faster for massive keyword strings
-            result = process.extractOne(q_lower, search_choices, scorer=fuzz.WRatio)
-            if result:
-                _, score, best_idx = result
-                best_row = df.iloc[best_idx]
-                
-                if score < threshold:
-                    results.append({"product": q, "category": "REJECTED", "category_code": None, "score": score})
-                else:
-                    results.append({"product": q, "category": best_row["category_path"], "category_code": best_row["category_code"], "score": score})
-            else:
-                results.append({"product": q, "category": "REJECTED", "category_code": None, "score": 0.0})
+            unseen_queries.append(q_lower)
+            unseen_indices.append(i)
+            
+    # BLAZING FAST MATH: Calculate everything else instantly
+    if unseen_queries:
+        q_vecs = vectorizer.transform(unseen_queries)
+        cosine_similarities = linear_kernel(q_vecs, tfidf_matrix)
         
-        # Update progress bar every 10 items or on the last item to save UI rendering time
-        if i % 10 == 0 or i == total - 1:
-            progress_bar.progress((i + 1) / total)
-            status_text.text(f"Processing {i + 1} of {total} products...")
+        best_indices = cosine_similarities.argmax(axis=1)
+        best_scores = cosine_similarities.max(axis=1) * 100
+        
+        for idx, best_idx, score in zip(unseen_indices, best_indices, best_scores):
+            best_row = df.iloc[best_idx]
+            
+            # Set the values
+            results[idx]["Score"] = round(score, 2)
+            results[idx]["Full Category Path"] = best_row["category_path"]
+            results[idx]["Category Code"] = best_row["category_code"]
+            
+            # Assign Status
+            if score < threshold:
+                results[idx]["Status"] = "❌ Rejected"
+            else:
+                results[idx]["Status"] = "✅ Approved"
                 
     return results
 
@@ -149,14 +162,15 @@ def batch_match_queries(queries, progress_bar, status_text):
 # 7. UI: SINGLE MATCH
 # ==========================================
 st.subheader("🔍 Single Match")
-query = st.text_input("Enter product name (e.g., 'Portable Bluetooth Radio')")
+query = st.text_input("Enter product name")
 
 if query:
-    match, code, score = match_query(query)
-    if match == "REJECTED":
-        st.warning(f"❌ Rejected (Score: {score:.2f})")
+    status, match, code, score = match_query(query)
+    
+    if "Rejected" in status:
+        st.warning(f"{status} (Score: {score:.2f}) | Best Guess: **{match}** (Code: {code})")
     else:
-        st.success(f"✅ {match} (Code: {code}) | Score: {score:.2f}")
+        st.success(f"{status} | **{match}** (Code: {code}) | Score: {score:.2f}")
 
     with st.expander("Teach the Engine (Override)"):
         correct = st.text_input("Correct category path")
@@ -178,7 +192,6 @@ st.subheader("📂 Bulk Batch Processing")
 bulk_file = st.file_uploader("Upload Product CSV", type=["csv"])
 
 if bulk_file:
-    # Handle files separated by commas or semicolons
     try:
         bulk_df = pd.read_csv(bulk_file, sep=";")
         if len(bulk_df.columns) == 1:
@@ -188,44 +201,49 @@ if bulk_file:
         st.error(f"Error reading CSV: {e}")
         st.stop()
 
-    # SMART COLUMN DETECTION - STRICTLY LOOKS FOR 'NAME'
     if "NAME" in bulk_df.columns:
         col = "NAME"
     elif "name" in bulk_df.columns:
         col = "name"
     else:
-        # Fallback avoiding IDs and Sellers
         col = next((c for c in bulk_df.columns if ("name" in c.lower() or "product" in c.lower()) and "id" not in c.lower() and "seller" not in c.lower()), None)
 
     if col:
         st.info(f"Detected product column: `{col}` ({len(bulk_df)} items)")
         if st.button("Start High-Speed Process"):
             
-            # Setup Progress Bar
-            progress_bar = st.progress(0)
-            status_text = st.empty()
-            
-            queries_list = bulk_df[col].tolist()
-            
-            # Pass progress bar into the function
-            results = batch_match_queries(queries_list, progress_bar, status_text)
+            with st.spinner(f"Running Matrix Math on {len(bulk_df)} items... ⚡"):
+                queries_list = bulk_df[col].tolist()
+                results = batch_match_queries(queries_list)
 
-            status_text.text("Processing Complete! ✅")
+            st.success("Processing Complete! ✅")
 
             out_df = pd.DataFrame(results)
-            st.dataframe(out_df.head(100)) # Show preview
+            
+            # Make the table look nice in Streamlit
+            st.dataframe(
+                out_df.head(100),
+                column_config={
+                    "Score": st.column_config.ProgressColumn(
+                        "Score",
+                        help="Confidence Score",
+                        format="%f",
+                        min_value=0,
+                        max_value=100,
+                    ),
+                }
+            )
 
-            # Analytics
             st.subheader("📊 Analytics")
             total = len(out_df)
-            rejected = len(out_df[out_df["category"] == "REJECTED"])
+            approved = len(out_df[out_df["Status"] == "✅ Approved"])
+            rejected = len(out_df[out_df["Status"] == "❌ Rejected"])
             
             col1, col2, col3 = st.columns(3)
             col1.metric("Total Processed", total)
-            col2.metric("Rejected (Needs Review)", rejected)
-            col3.metric("Average Score", round(out_df["score"].mean(), 2))
+            col2.metric("✅ Approved", approved)
+            col3.metric("❌ Rejected (Needs Review)", rejected)
 
-            # Download button
             csv_data = out_df.to_csv(index=False).encode('utf-8')
             st.download_button("📥 Download Matched Results", csv_data, "categorized_products.csv", "text/csv")
     else:
