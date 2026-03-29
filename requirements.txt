@@ -2,5 +2,7 @@ streamlit
 pandas
 numpy
 sentence-transformers
+torch
+torchvision
 faiss-cpu
 openpyxl
