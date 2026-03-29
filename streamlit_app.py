@@ -1,198 +1,129 @@
 import streamlit as st
 import pandas as pd
+import numpy as np
 import sqlite3
 import os
-from rapidfuzz import fuzz
+import re
+from rapidfuzz import fuzz, process
+from concurrent.futures import ThreadPoolExecutor
 
 # ==========================================
 # 1. SETUP & CONFIGURATION
 # ==========================================
-st.set_page_config(page_title="E-commerce Category Matcher", layout="wide")
-st.title("🛒 Professional Category Matcher")
+st.set_page_config(page_title="High-Perf Category Engine", layout="wide")
+st.title("⚡ Parallel Hierarchical Matcher")
 
 DB_PATH = "learning.db"
 CATEGORY_FILE = "category_map_fully_enriched.xlsx" 
 
 # ==========================================
-# 2. INITIALIZE DATABASE (For Learning Memory)
+# 2. NOISE CLEANING (Feature 6)
 # ==========================================
-def init_db():
-    conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
-    c.execute("""
-        CREATE TABLE IF NOT EXISTS feedback (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            query TEXT,
-            correct_category TEXT,
-            category_code TEXT
-        )
-    """)
-    conn.commit()
-    conn.close()
-
-init_db()
+def clean_product_name(text):
+    if not isinstance(text, str): return ""
+    text = text.lower()
+    # Remove measurements (ml, g, kg, units, tablets, etc.)
+    text = re.sub(r'\d+\s*(ml|g|kg|units|tablets|pcs|capsules|oz|s|count|ct)\b', '', text)
+    # Remove special characters and promo noise
+    text = re.sub(r'[^a-zA-Z0-9\s]', ' ', text)
+    text = re.sub(r'\b(free shipping|best price|new|promo|original|authentic|pack of)\b', '', text)
+    return " ".join(text.split())
 
 # ==========================================
-# 3. HIGH-SPEED MATCHER LOGIC
-# ==========================================
-class EcommerceCategoryMatcher:
-    def __init__(self, taxonomy_df):
-        self.df = taxonomy_df
-        # Pre-process taxonomy once for maximum speed
-        self.taxonomy = taxonomy_df["category_path"].tolist()
-        self.taxonomy_clean = [str(c).lower().replace(">", " ").replace("&", " ") for c in self.taxonomy]
-
-    def match(self, product_title, threshold=45, learned_dict=None):
-        if not product_title or not isinstance(product_title, str):
-            return "Uncategorized", None, 0.0, "❌ Rejected"
-
-        query = str(product_title).lower()
-        
-        # 1. Instant Learning Check
-        if learned_dict and query in learned_dict:
-            return learned_dict[query][0], learned_dict[query][1], 100.0, "✅ Approved"
-
-        best_match_path = "Uncategorized"
-        highest_score = 0.0
-        best_idx = -1
-        query_set = set(query.split())
-
-        # 2. Fast Fuzzy + Semantic Overlap Loop
-        for idx, cat_normalized in enumerate(self.taxonomy_clean):
-            # RapidFuzz similarity ratio (Fast C++ implementation)
-            similarity = fuzz.ratio(query, cat_normalized) / 100.0
-            
-            # Word Overlap logic
-            cat_set = set(cat_normalized.split())
-            intersection = query_set.intersection(cat_set)
-            overlap_score = (len(intersection) / len(cat_set)) if cat_set else 0
-            
-            # Weighted Final Score (40% Fuzzy, 60% Overlap)
-            final_score = (similarity * 0.4) + (overlap_score * 0.6)
-            
-            if final_score > highest_score:
-                highest_score = final_score
-                best_idx = idx
-
-        # Convert to 100-scale
-        score_pct = round(min(highest_score, 1.0) * 100, 2)
-        status = "✅ Approved" if score_pct >= threshold else "❌ Rejected"
-
-        if best_idx != -1:
-            best_row = self.df.iloc[best_idx]
-            return best_row["category_path"], best_row["category_code"], score_pct, status
-        
-        return "Uncategorized", None, score_pct, "❌ Rejected"
-
-# ==========================================
-# 4. DATA LOADING
+# 3. HIERARCHICAL DATA LOADING (Feature 3)
 # ==========================================
 @st.cache_data
-def load_taxonomy():
-    if not os.path.exists(CATEGORY_FILE):
-        st.error(f"❌ `{CATEGORY_FILE}` not found. Please ensure it is in your app folder.")
-        st.stop()
-    tdf = pd.read_excel(CATEGORY_FILE)
-    tdf.columns = tdf.columns.str.lower().str.strip().str.replace(' ', '_')
-    if "category_code" not in tdf.columns:
-        tdf["category_code"] = tdf.index.astype(str)
-    return tdf
+def load_hierarchical_data():
+    df = pd.read_excel(CATEGORY_FILE)
+    df.columns = df.columns.str.lower().str.strip().str.replace(' ', '_')
+    
+    # Extract Top Level Category (TLC)
+    # e.g., "Health & Beauty / Fragrance" -> "Health & Beauty"
+    df['tlc'] = df['category_path'].apply(lambda x: str(x).split('/')[0].strip())
+    
+    # Pre-process search text
+    df['search_text'] = (df['category_path'].astype(str) + " " + df['enriched_keywords'].fillna("")).str.lower()
+    
+    # Create unique list of TLCs for the first-pass match
+    tlc_list = df['tlc'].unique().tolist()
+    
+    return df, tlc_list
 
-taxonomy_df = load_taxonomy()
-matcher = EcommerceCategoryMatcher(taxonomy_df)
-
-# ==========================================
-# 5. SIDEBAR SETTINGS
-# ==========================================
-st.sidebar.header("⚙️ Settings")
-threshold = st.sidebar.slider("Approval Threshold", 0, 100, 45, help="Scores below this are 'Rejected'")
-st.sidebar.metric("Categories Loaded", len(taxonomy_df))
+df_main, tlc_list = load_hierarchical_data()
 
 # ==========================================
-# 6. APP TABS
+# 4. HIERARCHICAL MATCHING LOGIC
 # ==========================================
-tab1, tab2 = st.tabs(["Single Item", "Batch Process (CSV)"])
+def match_item(product_name, threshold=45, learned_dict=None):
+    original_query = str(product_name).lower()
+    clean_query = clean_product_name(product_name)
+    
+    # 1. Check Learning Database
+    if learned_dict and original_query in learned_dict:
+        return (original_query, "✅ Approved", *learned_dict[original_query], 100.0)
 
-with tab1:
-    st.header("Single Product Match")
-    p_input = st.text_input("Product Title:")
-    if st.button("Match"):
-        if p_input:
-            cat, code, score, status = matcher.match(p_input, threshold=threshold)
-            if status == "✅ Approved":
-                st.success(f"**{status}** | Category: {cat} | Score: {score}")
-            else:
-                st.warning(f"**{status}** | Best Guess: {cat} | Score: {score}")
-            
-            with st.expander("Teach the Engine"):
-                c_cat = st.text_input("Correct Path")
-                c_cod = st.text_input("Correct Code")
-                if st.button("Save Override"):
-                    conn = sqlite3.connect(DB_PATH)
-                    conn.execute("INSERT INTO feedback (query, correct_category, category_code) VALUES (?, ?, ?)", 
-                                 (p_input.lower(), c_cat, c_cod))
-                    conn.commit()
-                    conn.close()
-                    st.success("Learned! This will be 100% accurate next time.")
+    # 2. Step 1: Hierarchical Pass (Find the Department)
+    # Match against the short list of top-level categories
+    best_tlc = process.extractOne(clean_query, tlc_list, scorer=fuzz.token_set_ratio)
+    winning_tlc = best_tlc[0]
+    
+    # 3. Step 2: Deep Pass (Within that Department only)
+    # This ignores all categories in other departments
+    sub_df = df_main[df_main['tlc'] == winning_tlc]
+    
+    best_match = process.extractOne(
+        clean_query, 
+        sub_df['search_text'].tolist(), 
+        scorer=fuzz.token_set_ratio
+    )
+    
+    score = round(best_match[1], 2)
+    best_idx = sub_df.index[sub_df['search_text'].tolist().index(best_match[0])]
+    result_row = df_main.iloc[best_idx]
+    
+    status = "✅ Approved" if score >= threshold else "❌ Rejected"
+    
+    return (
+        product_name, 
+        status, 
+        result_row['category_path'], 
+        result_row['category_code'], 
+        score
+    )
 
-with tab2:
-    st.header("Batch Process")
-    u_file = st.file_uploader("Upload CSV", type="csv")
+# ==========================================
+# 5. PARALLEL BATCH PROCESSING
+# ==========================================
+def parallel_batch_process(names, threshold, learned_dict):
+    # Uses all available CPU threads to process multiple items at once
+    with ThreadPoolExecutor() as executor:
+        results = list(executor.map(lambda x: match_item(x, threshold, learned_dict), names))
+    return results
 
-    if u_file:
-        try:
-            df_up = pd.read_csv(u_file, sep=";", on_bad_lines='skip')
-            if len(df_up.columns) == 1:
-                u_file.seek(0)
-                df_up = pd.read_csv(u_file, sep=",", on_bad_lines='skip')
-        except Exception as e:
-            st.error(f"Error: {e}"); st.stop()
+# ==========================================
+# 6. UI: BATCH MATCHING
+# ==========================================
+st.sidebar.header("Settings")
+threshold = st.sidebar.slider("Threshold", 0, 100, 45)
 
-        # FIXED COLUMN SELECTION: Prioritize 'NAME'
-        col_name = "NAME" if "NAME" in df_up.columns else next((c for c in df_up.columns if "NAME" in c.upper()), df_up.columns[0])
-        st.info(f"Analyzing column: **{col_name}**")
-
-        if st.button("Start Processing ⚡"):
-            # Load learning DB once into RAM for speed
-            conn = sqlite3.connect(DB_PATH)
-            l_df = pd.read_sql("SELECT * FROM feedback", conn)
-            conn.close()
-            learned_dict = {row['query']: (row['correct_category'], row['category_code']) for _, row in l_df.iterrows()}
-
-            # Progress Bar Setup
-            progress_bar = st.progress(0)
-            status_txt = st.empty()
-            
-            results = []
-            total = len(df_up)
-            
-            for i, val in enumerate(df_up[col_name]):
-                # Call matcher
-                res = matcher.match(str(val), threshold=threshold, learned_dict=learned_dict)
-                results.append({
-                    "Product Name": val,
-                    "Status": res[3],
-                    "Category Path": res[0],
-                    "Category Code": res[1],
-                    "Score": res[2]
-                })
-                
-                # Update UI every 25 rows (keeps it fast)
-                if i % 25 == 0 or i == total - 1:
-                    progress_bar.progress((i + 1) / total)
-                    status_txt.text(f"Processing {i+1} of {total} products...")
-
-            out_df = pd.DataFrame(results)
-            status_txt.text("Batch Processing Complete! ✅")
-            
-            # Stats Display
-            st.divider()
-            c1, c2, c3 = st.columns(3)
-            c1.metric("Total Items", len(out_df))
-            c2.metric("✅ Approved", len(out_df[out_df["Status"] == "✅ Approved"]))
-            c3.metric("❌ Rejected", len(out_df[out_df["Status"] == "❌ Rejected"]))
-
-            st.dataframe(out_df, use_container_width=True)
-            
-            # Download Results
-            st.download_button("📥 Download Results", out_df.to_csv(index=False).encode('utf-8'), "categorized_results.csv")
+uploaded_file = st.file_uploader("Upload CSV", type="csv")
+if uploaded_file:
+    df_up = pd.read_csv(uploaded_file, on_bad_lines='skip')
+    # Auto-find 'NAME' column
+    col = next((c for c in df_up.columns if "NAME" in c.upper()), df_up.columns[0])
+    
+    if st.button("Run Parallel Hierarchical Process ⚡"):
+        # Load learned data
+        conn = sqlite3.connect(DB_PATH)
+        l_df = pd.read_sql("SELECT * FROM feedback", conn)
+        conn.close()
+        learned_dict = {row['query']: (row['correct_category'], row['category_code']) for _, row in l_df.iterrows()}
+        
+        with st.spinner(f"Processing {len(df_up)} items using Parallel CPU..."):
+            results = parallel_batch_process(df_up[col].tolist(), threshold, learned_dict)
+        
+        out_df = pd.DataFrame(results, columns=["Product Name", "Status", "Category Path", "Code", "Score"])
+        
+        st.success("Finished!")
+        st.dataframe(out_df)
+        st.download_button("📥 Download", out_df.to_csv(index=False).encode('utf-8'), "results.csv")
