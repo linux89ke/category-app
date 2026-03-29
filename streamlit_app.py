@@ -1,22 +1,19 @@
 import streamlit as st
 import pandas as pd
-import numpy as np
 import sqlite3
-import pickle
 import os
-from rapidfuzz import fuzz
-from sentence_transformers import SentenceTransformer
-import faiss
+from rapidfuzz import fuzz, process
 
 # ==========================================
 # 1. SETUP & CONFIGURATION
 # ==========================================
 st.set_page_config(page_title="Category Matching Engine", layout="wide")
-st.title("🧠 Ultimate Category Engine (Batched + FAISS)")
+st.title("⚡ Category Engine (Fuzzy Logic + Learning)")
 
 DB_PATH = "learning.db"
-CATEGORY_FILE = "category_map_fully_enriched.xlsx" 
-PROCESSED_DATA_FILE = "category_map_with_embeddings.pkl"
+# Make sure this matches your exact file name. 
+# If it's the CSV you uploaded earlier, use pd.read_csv() below. If it's Excel, use pd.read_excel()
+CATEGORY_FILE = "category_map_fully_enriched.xlsx - Sheet1.csv" 
 
 # ==========================================
 # 2. INITIALIZE DATABASE
@@ -38,56 +35,39 @@ def init_db():
 init_db()
 
 # ==========================================
-# 3. LOAD AI MODEL
+# 3. LOAD DATA (No AI Embeddings)
 # ==========================================
-@st.cache_resource
-def load_model():
-    return SentenceTransformer('all-MiniLM-L6-v2')
-
-model = load_model()
-
-# ==========================================
-# 4. LOAD DATA & EMBEDDINGS 
-# ==========================================
-if os.path.exists(PROCESSED_DATA_FILE):
-    with open(PROCESSED_DATA_FILE, "rb") as f:
-        df = pickle.load(f)
-else:
+@st.cache_data
+def load_data():
     if not os.path.exists(CATEGORY_FILE):
         st.error(f"❌ File not found: `{CATEGORY_FILE}`.")
         st.stop()
         
-    st.info("First run detected! Crunching AI embeddings...")
-    df = pd.read_excel(CATEGORY_FILE)
+    # Load the data (Change to pd.read_excel if it's genuinely an .xlsx file)
+    df = pd.read_csv(CATEGORY_FILE)
+    
+    # Standardize headers
     df.columns = df.columns.str.lower().str.strip().str.replace(' ', '_')
 
+    # Ensure required columns exist
     if "category_code" not in df.columns:
         df["category_code"] = df.index.astype(str)
 
     keywords = df["enriched_keywords"].fillna("").astype(str) if "enriched_keywords" in df.columns else ""
-    df["category_text"] = df["category_path"].astype(str) + " " + keywords
     
-    embeddings = model.encode(df["category_text"].tolist(), convert_to_numpy=True)
-    df["embedding"] = list(embeddings)
+    # Create the text to match against
+    df["search_text"] = df["category_path"].astype(str) + " " + keywords
     
-    with open(PROCESSED_DATA_FILE, "wb") as f:
-        pickle.dump(df, f)
-        
-    st.success("✅ Embeddings saved!")
+    return df
+
+df = load_data()
+search_choices = df["search_text"].tolist()
+st.success("System Ready ⚡")
 
 # ==========================================
-# 5. BUILD FAISS INDEX
-# ==========================================
-embeddings_matrix = np.vstack(df["embedding"].values).astype('float32')
-faiss.normalize_L2(embeddings_matrix)
-index = faiss.IndexFlatIP(embeddings_matrix.shape[1])
-index.add(embeddings_matrix)
-
-# ==========================================
-# 6. APP SETTINGS & LEARNING DATA
+# 4. APP SETTINGS & LEARNING DATA
 # ==========================================
 st.sidebar.header("⚙️ Settings")
-top_k = st.sidebar.slider("Suggestions to fetch", 1, 10, 3)
 threshold = st.sidebar.slider("Auto-reject threshold", 0, 100, 65)
 
 def get_learning():
@@ -99,107 +79,75 @@ def get_learning():
 learn_df = get_learning()
 
 # ==========================================
-# 7. CORE MATCHING LOGIC (Single)
+# 5. CORE MATCHING LOGIC (Fuzzy Only)
 # ==========================================
 def match_query(query):
     q = str(query).lower()
+    
+    # 1. Check if we already learned this exact product
     learned = learn_df[learn_df["query"] == q]
     if not learned.empty:
         row = learned.iloc[-1]
-        return row["correct_category"], row["category_code"], 100.0, pd.DataFrame() 
+        return row["correct_category"], row["category_code"], 100.0
 
-    q_emb = model.encode([q], convert_to_numpy=True).astype('float32')
-    faiss.normalize_L2(q_emb)
-
-    scores, indices = index.search(q_emb, top_k)
-    candidates = df.iloc[indices[0]].copy()
-    candidates["semantic_score"] = scores[0]
-
-    keyword_col = "enriched_keywords" if "enriched_keywords" in candidates.columns else "category_path"
-    candidates["keyword_score"] = candidates[keyword_col].apply(
-        lambda x: fuzz.token_set_ratio(q, str(x)) if pd.notna(x) else 0
-    )
-
-    candidates["final_score"] = (candidates["keyword_score"] * 0.5) + (candidates["semantic_score"] * 100 * 0.5)
+    # 2. RapidFuzz Exact/Fuzzy Search
+    # extractOne returns: (best_match_string, score, index_in_list)
+    result = process.extractOne(q, search_choices, scorer=fuzz.token_set_ratio)
     
-    # Sort by the combined final score to ensure the absolute best match is at the top
-    candidates = candidates.sort_values(by="final_score", ascending=False)
-    best = candidates.iloc[0]
-
-    if best["final_score"] < threshold:
-        return "REJECTED", None, best["final_score"], candidates
-    else:
-        return best["category_path"], best["category_code"], best["final_score"], candidates
+    if result:
+        best_match_str, score, best_idx = result
+        best_row = df.iloc[best_idx]
+        
+        if score < threshold:
+            return "REJECTED", None, score
+        else:
+            return best_row["category_path"], best_row["category_code"], score
+            
+    return "REJECTED", None, 0.0
 
 # ==========================================
-# 8. HIGH-SPEED BATCH LOGIC (For Bulk Uploads)
+# 6. HIGH-SPEED BATCH LOGIC
 # ==========================================
 def batch_match_queries(queries):
     results = []
     
-    # Pre-load learned dictionary for instant O(1) lookups
+    # Pre-load learned dictionary for instant lookups
     learned_dict = {row["query"]: (row["correct_category"], row["category_code"]) for _, row in learn_df.iterrows()}
     
-    needs_ai_indices = []
-    needs_ai_queries = []
-    
-    # Filter out empty queries and check if we already learned the answer
     for i, q in enumerate(queries):
         if pd.isna(q) or str(q).strip() == "":
             continue
             
         q_lower = str(q).lower()
+        
+        # Check dictionary first
         if q_lower in learned_dict:
             cat, code = learned_dict[q_lower]
-            results.append({"index": i, "product": q, "category": cat, "category_code": code, "score": 100.0})
+            results.append({"product": q, "category": cat, "category_code": code, "score": 100.0})
         else:
-            needs_ai_indices.append(i)
-            needs_ai_queries.append(q_lower)
-            
-    # If we have queries that need the AI, process them ALL AT ONCE
-    if needs_ai_queries:
-        # 1. Batch Encode (32 items at a time internally)
-        q_embs = model.encode(needs_ai_queries, batch_size=32, convert_to_numpy=True).astype('float32')
-        faiss.normalize_L2(q_embs)
-        
-        # 2. Batch Search FAISS
-        all_scores, all_indices = index.search(q_embs, top_k)
-        
-        # 3. Score combinations
-        keyword_col = "enriched_keywords" if "enriched_keywords" in df.columns else "category_path"
-        
-        for idx, q_text, scores, indices_row in zip(needs_ai_indices, needs_ai_queries, all_scores, all_indices):
-            candidates = df.iloc[indices_row].copy()
-            candidates["semantic_score"] = scores
-            candidates["keyword_score"] = candidates[keyword_col].apply(
-                lambda x: fuzz.token_set_ratio(q_text, str(x)) if pd.notna(x) else 0
-            )
-            candidates["final_score"] = (candidates["keyword_score"] * 0.5) + (candidates["semantic_score"] * 100 * 0.5)
-            candidates = candidates.sort_values(by="final_score", ascending=False)
-            best = candidates.iloc[0]
-            
-            if best["final_score"] < threshold:
-                results.append({"index": idx, "product": queries[idx], "category": "REJECTED", "category_code": None, "score": best["final_score"]})
-            else:
-                results.append({"index": idx, "product": queries[idx], "category": best["category_path"], "category_code": best["category_code"], "score": best["final_score"]})
+            # Fallback to RapidFuzz
+            result = process.extractOne(q_lower, search_choices, scorer=fuzz.token_set_ratio)
+            if result:
+                _, score, best_idx = result
+                best_row = df.iloc[best_idx]
                 
-    # Re-sort results back to original CSV order
-    results = sorted(results, key=lambda x: x["index"])
-    
-    # Clean up the "index" key before returning
-    for r in results:
-        del r["index"]
-        
+                if score < threshold:
+                    results.append({"product": q, "category": "REJECTED", "category_code": None, "score": score})
+                else:
+                    results.append({"product": q, "category": best_row["category_path"], "category_code": best_row["category_code"], "score": score})
+            else:
+                results.append({"product": q, "category": "REJECTED", "category_code": None, "score": 0.0})
+                
     return results
 
 # ==========================================
-# 9. UI: SINGLE MATCH
+# 7. UI: SINGLE MATCH
 # ==========================================
 st.subheader("🔍 Single Match")
 query = st.text_input("Enter product name")
 
 if query:
-    match, code, score, candidates = match_query(query)
+    match, code, score = match_query(query)
     if match == "REJECTED":
         st.warning(f"❌ Rejected (Score: {score:.2f})")
     else:
@@ -217,7 +165,7 @@ if query:
             st.success("Learned! ✅")
 
 # ==========================================
-# 10. UI: BULK MATCHING
+# 8. UI: BULK MATCHING
 # ==========================================
 st.divider()
 st.subheader("📂 Bulk Batch Processing")
@@ -238,10 +186,9 @@ if bulk_file:
 
     if col:
         st.info(f"Detected product column: `{col}` ({len(bulk_df)} items)")
-        if st.button("Start High-Speed Process"):
+        if st.button("Start Processing"):
             
-            with st.spinner(f"Engaging Batch AI Processing for {len(bulk_df)} items... ⚡"):
-                # Pass all items directly to the new Batch Matcher
+            with st.spinner(f"Fuzzy matching {len(bulk_df)} items... ⚡"):
                 queries_list = bulk_df[col].tolist()
                 results = batch_match_queries(queries_list)
 
