@@ -26,7 +26,7 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 st.title("Category Test")
-st.caption("Standardized Taxonomy Audit Engine | TF-IDF Vectorization & Fuzzy Re-ranking")
+st.caption("Standardized Taxonomy Audit Engine | Focus: Exception-Based Reporting")
 
 # ==============================================================================
 # 2. UNIVERSAL LOGIC & CLEANING
@@ -60,7 +60,6 @@ def build_index():
     df = pd.read_excel(CATEGORY_FILE)
     raw_cols = df.columns.tolist()
 
-    # Smart detection of columns
     path_col = next((c for c in raw_cols if 'PATH' in c.upper()), None)
     kw_col = next((c for c in raw_cols if 'KEY' in c.upper()), None)
     code_col = next((c for c in raw_cols if 'CODE' in c.upper()), None)
@@ -77,13 +76,12 @@ def build_index():
     vectorizer = TfidfVectorizer(ngram_range=(1, 2), sublinear_tf=True, strip_accents='unicode')
     tfidf_matrix = vectorizer.fit_transform(df['search_text'])
 
-    # Code Mapping
     clean_codes = df[code_col].astype(str).str.replace(r'\.0$', '', regex=True).str.strip()
     code_to_path = dict(zip(clean_codes, df[path_col]))
 
     return df, vectorizer, tfidf_matrix, code_to_path, path_col
 
-df_cat, vectorizer, tfidf_matrix, code_to_path, PATH_COL_NAME = build_index()
+df_cat, vectorizer, tfidf_matrix, master_code_map, PATH_COL_NAME = build_index()
 
 # ==============================================================================
 # 4. SCORING ENGINE
@@ -114,6 +112,7 @@ def calculate_match(clean_q, top_idxs, sims_row, threshold):
     if best_row is None: return "Uncategorized", 0.0, "Rejected"
 
     conf = round(min(best_score * 120.0, 100.0), 1)
+    
     if conf >= threshold and best_score > 0.22:
         status = "Approved"
     elif conf > (threshold - 15):
@@ -128,17 +127,15 @@ def calculate_match(clean_q, top_idxs, sims_row, threshold):
 # ==============================================================================
 with st.sidebar:
     st.header("Parameters")
-    # Return of the Slider
     threshold = st.slider("Confidence Threshold", 0, 100, 40)
     st.divider()
-    st.caption("Upload product data in CSV format. Column detection is automated.")
+    st.info("When Status is 'Approved' and the path matches, the AI Category will be hidden to highlight only required changes.")
 
 uploaded_file = st.file_uploader("Upload CSV", type="csv")
 
 if uploaded_file:
     df_up = pd.read_csv(uploaded_file, sep=None, engine='python', on_bad_lines='skip')
     
-    # Locate required input columns
     name_col = next((c for c in df_up.columns if "NAME" in c.upper()), df_up.columns[0])
     category_col = next((c for c in df_up.columns if "CATEGORY" in c.upper() and "AI" not in c.upper() and "PATH" not in c.upper()), None)
     code_col = next((c for c in df_up.columns if "CODE" in c.upper() and "AI" not in c.upper()), None)
@@ -147,7 +144,6 @@ if uploaded_file:
         names = df_up[name_col].fillna("").astype(str).tolist()
         cleaned_queries = [clean_standard(n) for n in names]
         
-        # Matrix calculation for performance
         q_vecs = vectorizer.transform(cleaned_queries)
         all_sims = cosine_similarity(q_vecs, tfidf_matrix)
         
@@ -158,27 +154,34 @@ if uploaded_file:
             results.append(calculate_match(cleaned_queries[i], t_idxs, s_row, threshold))
 
         # Assign Results
-        df_up["AI Category"] = [r[0] for r in results]
+        df_up["AI Category RAW"] = [r[0] for r in results]
         df_up["confidence"] = [r[1] for r in results]
         df_up["status"] = [r[2] for r in results]
         
-        # Mapping existing path if code exists
+        # Resolve Current Path
         if code_col:
             clean_codes = df_up[code_col].astype(str).str.replace(r'\.0$', '', regex=True).str.strip()
-            df_up["Assigned category in full"] = clean_codes.map(code_to_path).fillna("Unknown Code")
+            df_up["Assigned category in full"] = clean_codes.map(master_code_map).fillna("Unknown Code")
         else:
             df_up["Assigned category in full"] = "N/A"
 
+        # --- EXCEPTION LOGIC ---
+        # If AI suggestion matches Current and it is Approved, hide the suggestion.
+        # This makes it easier to see where the AI wants to change the category.
+        def filter_suggestion(row):
+            if row["status"] == "Approved" and row["AI Category RAW"] == row["Assigned category in full"]:
+                return "-"
+            return row["AI Category RAW"]
+
+        df_up["AI Category"] = df_up.apply(filter_suggestion, axis=1)
+
         # Final Formatting
-        # Rename original column for the specific requested display
         display_map = {name_col: "NAME"}
         if category_col: display_map[category_col] = "CATEGORY"
         df_up = df_up.rename(columns=display_map)
         
-        # Ensure CATEGORY exists for the table even if not in file
         if "CATEGORY" not in df_up.columns: df_up["CATEGORY"] = "N/A"
 
-        # Limit to specific requested columns
         final_cols = ["NAME", "Assigned category in full", "CATEGORY", "AI Category", "confidence", "status"]
         
         st.subheader("Analysis Results")
@@ -187,10 +190,10 @@ if uploaded_file:
             column_config={
                 "confidence": st.column_config.ProgressColumn("Confidence", format="%.1f%%", min_value=0, max_value=100),
                 "Assigned category in full": st.column_config.TextColumn("Current Path", width="large"),
-                "AI Category": st.column_config.TextColumn("Suggested Path", width="large"),
+                "AI Category": st.column_config.TextColumn("Suggested Change", width="large"),
             },
             use_container_width=True,
             hide_index=True
         )
         
-        st.download_button("Export Results", df_up[final_cols].to_csv(index=False).encode('utf-8'), "category_test_results.csv")
+        st.download_button("Export Results", df_up[final_cols].to_csv(index=False).encode('utf-8'), "category_audit.csv")
