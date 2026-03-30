@@ -1,6 +1,4 @@
-### Patched Streamlit App
 
-```python
 import streamlit as st
 import pandas as pd
 import numpy as np
@@ -349,6 +347,5 @@ if uploaded_file:
             sample_explain = pd.DataFrame(explains).head(10)
             st.table(sample_explain)
 
-# End of script
-```
+
 
