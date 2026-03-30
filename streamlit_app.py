@@ -8,7 +8,7 @@ from sklearn.metrics.pairwise import cosine_similarity
 from rapidfuzz import fuzz
 
 # ==============================================================================
-# 1. SETTINGS & STYLE
+# 1. SETTINGS & PROFESSIONAL STYLE
 # ==============================================================================
 st.set_page_config(page_title="Category Test", layout="wide")
 
@@ -20,16 +20,16 @@ st.markdown("""
     html, body, [class*="css"] { font-family: 'IBM Plex Sans', sans-serif; }
     .stApp { background-color: #f8f9fa; color: #1c1e21; }
     h1 { font-family: 'IBM Plex Mono', monospace !important; color: #000000 !important; border-bottom: 2px solid #000000; padding-bottom: 10px; }
-    .stButton > button { background: #000000 !important; color: white !important; border-radius: 4px; width: 100%; border: none; font-weight: 600; padding: 10px; }
+    .stButton > button { background: #000000 !important; color: white !important; border-radius: 4px; width: 100%; border: none; font-weight: 600; }
     .stDataFrame { border: 1px solid #dee2e6; border-radius: 4px; }
 </style>
 """, unsafe_allow_html=True)
 
 st.title("Category Test")
-st.caption("Standardized Taxonomy Audit Engine | TF-IDF Vectorization | Multi-Layer Scoring")
+st.caption("Standardized Taxonomy Audit Engine | Version 2026.1")
 
 # ==============================================================================
-# 2. LOGIC DICTIONARIES (Extracted from Engine)
+# 2. UNIVERSAL LOGIC & CLEANING
 # ==============================================================================
 DOMAIN_SIGNALS = {
     "phone": {"Phones & Tablets"}, "mobile": {"Phones & Tablets"}, "tablet": {"Phones & Tablets"},
@@ -68,11 +68,10 @@ def build_index():
     df['leaf_name'] = df['path_str'].apply(lambda x: x.split('/')[-1].strip().lower())
     df['depth'] = df['path_str'].apply(lambda x: x.count('/') + 1)
     
-    # Weights: Focus heavily on the full path and the manual keywords
     p_clean = df['path_str'].str.replace('/', ' ').str.lower()
     k_clean = df[kw_col].fillna('').astype(str).str.lower() if kw_col else ""
 
-    df['search_text'] = (p_clean + ' ') * 5 + k_clean
+    df['search_text'] = (p_clean + ' ') * 4 + k_clean
 
     vectorizer = TfidfVectorizer(ngram_range=(1, 2), sublinear_tf=True, strip_accents='unicode')
     tfidf_matrix = vectorizer.fit_transform(df['search_text'])
@@ -85,29 +84,26 @@ def build_index():
 df_cat, vectorizer, tfidf_matrix, master_code_map, PATH_COL_NAME = build_index()
 
 # ==============================================================================
-# 4. SCORING ENGINE (Includes Domain Penalties)
+# 4. SCORING ENGINE
 # ==============================================================================
 def calculate_match(clean_q, top_idxs, sims_row, threshold):
     best_score, best_row = -1.0, None
-    query_tokens = set(clean_q.split())
+    raw_tokens = set(clean_q.split())
     
     required_verticals = set()
-    for tok in query_tokens:
+    for tok in raw_tokens:
         if tok in DOMAIN_SIGNALS:
             required_verticals |= DOMAIN_SIGNALS[tok]
 
     for idx in top_idxs:
         row = df_cat.iloc[idx]
         cos = float(sims_row[idx])
-        # Fuzzy match vs the leaf (the end of the category)
         name_fuzz = fuzz.token_set_ratio(clean_q, row['leaf_name']) / 100.0
         
-        # Domain Penalty Logic
         top_level = str(row[PATH_COL_NAME]).split('/')[0].strip()
         penalty = 0.25 if (required_verticals and top_level not in required_verticals) else 0.0
 
-        # Score calculation
-        score = (cos * 0.50) + (name_fuzz * 0.35) + (int(row['depth']) * 0.01) - penalty
+        score = (cos * 0.50) + (name_fuzz * 0.30) + (int(row['depth']) * 0.01) - penalty
 
         if score > best_score:
             best_score = score
@@ -115,11 +111,11 @@ def calculate_match(clean_q, top_idxs, sims_row, threshold):
 
     if best_row is None: return "Uncategorized", 0.0, "Rejected"
 
-    conf = round(min(best_score * 115.0, 100.0), 1)
+    conf = round(min(best_score * 120.0, 100.0), 1)
     
     if conf >= threshold and best_score > 0.22:
         status = "Approved"
-    elif conf > (threshold - 12):
+    elif conf > (threshold - 15):
         status = "Review"
     else:
         status = "Rejected"
@@ -131,11 +127,11 @@ def calculate_match(clean_q, top_idxs, sims_row, threshold):
 # ==============================================================================
 with st.sidebar:
     st.header("Parameters")
-    threshold = st.slider("Confidence Threshold", 0, 100, 42)
+    threshold = st.slider("Confidence Threshold", 0, 100, 40)
     st.divider()
-    st.info("Exception Reporting: The Suggested Change is only displayed if it differs from the current assignment.")
+    st.info("Highlights differences between original and AI categories.")
 
-uploaded_file = st.file_uploader("Upload Product CSV", type="csv")
+uploaded_file = st.file_uploader("Upload CSV", type="csv")
 
 if uploaded_file:
     df_up = pd.read_csv(uploaded_file, sep=None, engine='python', on_bad_lines='skip')
@@ -144,7 +140,8 @@ if uploaded_file:
     category_col = next((c for c in df_up.columns if "CATEGORY" in c.upper() and "AI" not in c.upper() and "PATH" not in c.upper()), None)
     code_col = next((c for c in df_up.columns if "CODE" in c.upper() and "AI" not in c.upper()), None)
 
-    if st.button("Process Batch Analysis"):
+    # Use width='stretch' for the button to resolve the warning
+    if st.button("Process Batch Analysis", width="stretch"):
         names = df_up[name_col].fillna("").astype(str).tolist()
         cleaned_queries = [clean_standard(n) for n in names]
         
@@ -157,19 +154,16 @@ if uploaded_file:
             t_idxs = np.argpartition(s_row, -40)[-40:]
             results.append(calculate_match(cleaned_queries[i], t_idxs, s_row, threshold))
 
-        # Assign Results
         df_up["AI Category RAW"] = [r[0] for r in results]
         df_up["confidence"] = [r[1] for r in results]
         df_up["status"] = [r[2] for r in results]
         
-        # Resolve Current Path from provided Code
         if code_col:
             clean_codes = df_up[code_col].astype(str).str.replace(r'\.0$', '', regex=True).str.strip()
             df_up["Assigned category in full"] = clean_codes.map(master_code_map).fillna("Unknown Code")
         else:
             df_up["Assigned category in full"] = "N/A"
 
-        # EXCEPTION LOGIC: Hide suggestion if AI agrees with Current assignment
         def filter_suggestion(row):
             if row["status"] == "Approved" and row["AI Category RAW"] == row["Assigned category in full"]:
                 return "-"
@@ -177,24 +171,25 @@ if uploaded_file:
 
         df_up["AI Category"] = df_up.apply(filter_suggestion, axis=1)
 
-        # Standardize Display Names
+        # Standardize Display
         display_map = {name_col: "NAME"}
         if category_col: display_map[category_col] = "CATEGORY"
         df_up = df_up.rename(columns=display_map)
+        
         if "CATEGORY" not in df_up.columns: df_up["CATEGORY"] = "N/A"
 
-        # Final Table Columns
         final_cols = ["NAME", "Assigned category in full", "CATEGORY", "AI Category", "confidence", "status"]
         
         st.subheader("Analysis Results")
+        # Use width='stretch' for the dataframe to resolve the warning
         st.dataframe(
             df_up[final_cols].head(2000),
             column_config={
                 "confidence": st.column_config.ProgressColumn("Confidence", format="%.1f%%", min_value=0, max_value=100),
-                "Assigned category in full": st.column_config.TextColumn("Current Category", width="large"),
+                "Assigned category in full": st.column_config.TextColumn("Current Path", width="large"),
                 "AI Category": st.column_config.TextColumn("Suggested Change", width="large"),
             },
-            use_container_width=True,
+            width="stretch",
             hide_index=True
         )
         
