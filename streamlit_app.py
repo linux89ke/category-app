@@ -26,7 +26,7 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 st.title("Category Test")
-st.caption("Taxonomy Integrity Audit | Standardized Scoring | Domain Guardrails")
+st.caption("Taxonomy Integrity Audit | Hard Safety Floor (20%) | Domain Guardrails")
 
 # ==============================================================================
 # 2. DOMAIN SIGNALS & FILTERS
@@ -78,7 +78,6 @@ def build_index():
     p_clean = df['path_str'].str.replace('/', ' ').str.lower()
     k_clean = df[kw_col].fillna('').astype(str).str.lower() if kw_col else ""
 
-    # Path (x4) + Enriched Keywords (x2)
     df['search_text'] = (p_clean + ' ') * 4 + (k_clean + ' ') * 2
 
     vectorizer = TfidfVectorizer(ngram_range=(1, 2), sublinear_tf=True, strip_accents='unicode')
@@ -92,7 +91,7 @@ def build_index():
 df_cat, vectorizer, tfidf_matrix, master_code_map, PATH_COL_NAME = build_index()
 
 # ==============================================================================
-# 4. SCORING ENGINE (Accessories Penalty Removed)
+# 4. SCORING ENGINE (With 20% Hard Floor)
 # ==============================================================================
 def calculate_match(clean_q, top_idxs, sims_row, threshold, current_vertical=None):
     best_score, best_row = -1.0, None
@@ -113,10 +112,7 @@ def calculate_match(clean_q, top_idxs, sims_row, threshold, current_vertical=Non
         path_tokens = set(path_str.lower().replace("/", " ").split())
         coverage = len(query_tokens & path_tokens) / max(len(query_tokens), 1)
 
-        # Domain Penalty - keeps items in the correct department
         penalty = 0.40 if (required_verticals and top_level not in required_verticals) else 0.0
-
-        # Score formula (Ambiguity penalty removed)
         score = (cos * 0.40) + (fuzz.token_set_ratio(clean_q, row['leaf_name'])/100 * 0.40) + (coverage * 0.20) - penalty
 
         if score > best_score:
@@ -126,7 +122,14 @@ def calculate_match(clean_q, top_idxs, sims_row, threshold, current_vertical=Non
     if best_row is None: return "-", 0.0, "Rejected"
 
     conf = round(min(max(best_score * 160.0, 0.0), 100.0), 1)
-    status = "Approved" if (conf >= threshold and best_score > 0.28) else "Rejected"
+    
+    # Logic: Reject if confidence is below 20, regardless of threshold slider
+    if conf < 20.0:
+        status = "Rejected"
+    elif conf >= threshold and best_score > 0.28:
+        status = "Approved"
+    else:
+        status = "Rejected"
     
     return best_row[PATH_COL_NAME], conf, status
 
@@ -137,7 +140,7 @@ with st.sidebar:
     st.header("Parameters")
     threshold = st.slider("Confidence Threshold", 0, 100, 60)
     st.divider()
-    st.info("System matches product names against the taxonomy to validate current assignments.")
+    st.caption("Assignments with < 20% confidence are automatically rejected.")
 
 uploaded_file = st.file_uploader("Upload Product CSV", type="csv")
 
@@ -157,7 +160,6 @@ if uploaded_file:
         q_vecs = vectorizer.transform(cleaned_queries)
         all_sims = cosine_similarity(q_vecs, tfidf_matrix)
         
-        # Resolve Current Category
         if code_col:
             clean_codes = df_up[code_col].astype(str).str.replace(r'\.0$', '', regex=True).str.strip()
             df_up["Assigned category in full"] = clean_codes.map(master_code_map).fillna("Unknown Code")
@@ -178,13 +180,11 @@ if uploaded_file:
         df_up["confidence"] = [r[1] for r in results]
         df_up["status"] = [r[2] for r in results]
 
-        # Final Formatting
         display_map = {name_col: "NAME"}
         if category_col: display_map[category_col] = "CATEGORY"
         df_up = df_up.rename(columns=display_map)
         if "CATEGORY" not in df_up.columns: df_up["CATEGORY"] = "N/A"
 
-        # Strictly requested columns
         final_cols = ["NAME", "Assigned category in full", "CATEGORY", "confidence", "status"]
         
         st.subheader("Analysis Results")
