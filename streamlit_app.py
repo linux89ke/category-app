@@ -11,14 +11,14 @@ from rapidfuzz import fuzz
 # ==========================================
 # 1. SETUP & CONFIGURATION
 # ==========================================
-st.set_page_config(page_title="Category Matcher Pro", layout="wide")
-st.title("🛡️ Professional Category Matcher")
+st.set_page_config(page_title="AI Category Auditor", layout="wide")
+st.title("🛡️ Professional Category Matcher & Auditor")
 
 DB_PATH = "learning.db"
 CATEGORY_FILE = "category_map_fully_enriched.xlsx"
 
 # ==========================================
-# 2. DICTIONARIES & NOISE FILTERS (Your Logic)
+# 2. DICTIONARIES & NOISE FILTERS
 # ==========================================
 _BRANDS = {
     'samsung', 'apple', 'sony', 'lg', 'huawei', 'xiaomi', 'nokia', 'oppo',
@@ -71,17 +71,14 @@ def clean_query(text: str) -> str:
     text = re.sub(r'\d+\s*(ml|cl|l|g|kg|mg|units|tablets|pcs|capsules|oz|count|ct|inch|cm|mm|w|kw|mah|gb|tb|mb|m\b)', '', text)
     text = re.sub(r'[^a-z\s]', ' ', text)
     tokens = [t for t in text.split() if t not in _ALL_QUERY_NOISE and len(t) > 1]
-    
     expanded = []
     for t in tokens:
         expanded.append(t)
         if t in _EXPANSIONS: expanded.extend(_EXPANSIONS[t].split())
-    
     if expanded:
         last = expanded[-1]
         if not last.endswith('s'): expanded.append(last + 's')
         elif len(last) > 4: expanded.append(last[:-1])
-    
     return " ".join(expanded).strip() or re.sub(r'[^a-z\s]', ' ', text.lower()).strip()
 
 def clean_category_text(text: str) -> str:
@@ -91,22 +88,21 @@ def clean_category_text(text: str) -> str:
 # ==========================================
 # 3. DATA LOADING & INDEX BUILDING
 # ==========================================
-@st.cache_resource(show_spinner="Building High-Precision Index…")
+@st.cache_resource(show_spinner="Building high-speed search index…")
 def build_index():
     if not os.path.exists(CATEGORY_FILE):
-        st.error(f"❌ `{CATEGORY_FILE}` not found."); st.stop()
+        st.error(f"❌ `{CATEGORY_FILE}` not found. Place it in the same folder as this script."); st.stop()
 
     df = pd.read_excel(CATEGORY_FILE)
     df.columns = df.columns.str.lower().str.strip().str.replace(' ', '_')
     df['depth'] = df['category_path'].apply(lambda x: str(x).count('/') + 1)
 
-    # Building search text with Synthetic injection
     df['path_clean'] = df['category_path'].apply(clean_category_text)
     df['kw_clean'] = df['keywords'].fillna('').apply(clean_category_text)
     df['synthetic'] = df['category_path'].map(_SYNTHETIC_CATEGORY_KW).fillna('')
     df['search_text'] = (df['path_clean'] + ' ') * 3 + df['kw_clean'] + ' ' + df['synthetic']
 
-    vectorizer = TfidfVectorizer(ngram_range=(1, 2), min_df=2, sublinear_tf=True, max_features=80000)
+    vectorizer = TfidfVectorizer(ngram_range=(1, 2), min_df=2, sublinear_tf=True, max_features=80000, strip_accents='unicode')
     tfidf_matrix = vectorizer.fit_transform(df['search_text'])
 
     code_to_path = dict(zip(df['category_code'].astype(str), df['category_path']))
@@ -115,7 +111,7 @@ def build_index():
 df_main, vectorizer, tfidf_matrix, master_code_map = build_index()
 
 # ==========================================
-# 4. RE-RANKING LOGIC
+# 4. RE-RANKING ENGINE
 # ==========================================
 def rerank(clean_query, top_idx, sims_row, threshold):
     best_combined = -1.0
@@ -131,10 +127,11 @@ def rerank(clean_query, top_idx, sims_row, threshold):
     
     if best_row is None: return "Uncategorized", None, 0.0, "❌ Rejected"
     conf = round(min(best_combined * 125.0, 100.0), 2)
-    return best_row['category_path'], str(best_row['category_code']), conf, ("✅ Approved" if conf >= threshold else "❌ Rejected")
+    status = "✅ Approved" if conf >= threshold else "❌ Rejected"
+    return best_row['category_path'], str(best_row['category_code']), conf, status
 
 # ==========================================
-# 5. UI & BATCH
+# 5. UI & BATCH PROCESSING
 # ==========================================
 st.sidebar.header("Configuration")
 threshold = st.sidebar.slider("Match threshold", 0, 100, 35)
@@ -142,22 +139,26 @@ threshold = st.sidebar.slider("Match threshold", 0, 100, 35)
 uploaded_file = st.file_uploader("Upload Product CSV", type="csv")
 
 if uploaded_file:
-    df_up = pd.read_csv(uploaded_file, on_bad_lines='skip')
+    try:
+        df_up = pd.read_csv(uploaded_file, on_bad_lines='skip')
+        if len(df_up.columns) == 1:
+            uploaded_file.seek(0)
+            df_up = pd.read_csv(uploaded_file, sep=";", on_bad_lines='skip')
+    except Exception as e:
+        st.error(f"Error reading file: {e}"); st.stop()
+
     name_col = next((c for c in df_up.columns if "NAME" in c.upper()), df_up.columns[0])
     code_col = next((c for c in df_up.columns if "CODE" in c.upper() and "MATCH" not in c.upper()), None)
 
     if code_col:
-        df_up["Assigned Full Path"] = df_up[code_col].astype(str).map(master_code_map).fillna("⚠️ Unknown Code")
+        df_up["Assigned Full Path"] = df_up[code_col].astype(str).map(master_code_map).fillna("⚠️ Unknown")
 
     if st.button("Start AI Analysis 🚀"):
         names = df_up[name_col].fillna("").tolist()
-        
-        # Phase 1: Matrix Transform (Fast)
         cleaned_queries = [clean_query(n) for n in names]
         q_vecs = vectorizer.transform(cleaned_queries)
         all_sims = cosine_similarity(q_vecs, tfidf_matrix)
         
-        # Phase 2: Scoring
         results = []
         progress_bar = st.progress(0.0)
         for i in range(len(names)):
@@ -167,10 +168,30 @@ if uploaded_file:
             results.append(rerank(cleaned_queries[i], top_idx, sims_row, threshold))
             if i % 50 == 0: progress_bar.progress((i + 1) / len(names))
 
-        # Build Output
+        # Update dataframe
         df_up["AI Category"] = [r[0] for r in results]
+        df_up["Matched Code"] = [r[1] for r in results]
         df_up["Confidence"] = [r[2] for r in results]
         df_up["Status"] = [r[3] for r in results]
 
-        st.dataframe(df_up[[name_col, "Status", "AI Category", "Confidence"]].head(1000), use_container_width=True)
-        st.download_button("📥 Download Results", df_up.to_csv(index=False).encode("utf-8"), "results.csv")
+        # --- ENHANCED READABLE UI ---
+        st.subheader("📊 Comparison Analysis")
+        
+        column_configuration = {
+            name_col: st.column_config.TextColumn("Product Name", width="medium"),
+            "Status": st.column_config.TextColumn("Result", width="small"),
+            "Assigned Full Path": st.column_config.TextColumn("Current Category", width="large"),
+            "AI Category": st.column_config.TextColumn("AI Suggestion", width="large"),
+            "Confidence": st.column_config.ProgressColumn("Match Score", format="%f%%", min_value=0, max_value=100)
+        }
+
+        actual_cols = [c for c in [name_col, "Status", "Assigned Full Path", "AI Category", "Confidence"] if c in df_up.columns]
+
+        st.dataframe(
+            df_up[actual_cols].head(1000),
+            column_config=column_configuration,
+            use_container_width=True,
+            hide_index=True
+        )
+        
+        st.download_button("📥 Download Results", df_up.to_csv(index=False).encode("utf-8"), "audit_results.csv")
