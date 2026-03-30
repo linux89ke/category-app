@@ -11,7 +11,6 @@ from rapidfuzz import fuzz
 # 1. SETTINGS & PROFESSIONAL STYLE
 # ==============================================================================
 st.set_page_config(page_title="Category Test", layout="wide")
-
 CATEGORY_FILE = "category_map_fully_enriched.xlsx"
 
 st.markdown("""
@@ -20,24 +19,34 @@ st.markdown("""
     html, body, [class*="css"] { font-family: 'IBM Plex Sans', sans-serif; }
     .stApp { background-color: #f8f9fa; color: #1c1e21; }
     h1 { font-family: 'IBM Plex Mono', monospace !important; color: #000000 !important; border-bottom: 2px solid #000000; padding-bottom: 10px; }
-    .stButton > button { background: #000000 !important; color: white !important; border-radius: 4px; width: 100%; border: none; font-weight: 600; }
+    .stButton > button { background: #000000 !important; color: white !important; border-radius: 4px; width: 100%; border: none; font-weight: 600; padding: 10px; }
     .stDataFrame { border: 1px solid #dee2e6; border-radius: 4px; }
 </style>
 """, unsafe_allow_html=True)
 
 st.title("Category Test")
-st.caption("Standardized Taxonomy Audit Engine | Version 2026.1")
+st.caption("Enhanced Taxonomy Audit Engine | Version 2.0 | Advanced Domain Filtering")
 
 # ==============================================================================
-# 2. UNIVERSAL LOGIC & CLEANING
+# 2. ENHANCED LOGIC DICTIONARIES
 # ==============================================================================
+# Domain Anchors: Prevent items from leaving their vertical
 DOMAIN_SIGNALS = {
     "phone": {"Phones & Tablets"}, "mobile": {"Phones & Tablets"}, "tablet": {"Phones & Tablets"},
     "laptop": {"Computing"}, "computer": {"Computing"}, "notebook": {"Computing"},
-    "shoe": {"Fashion"}, "sneaker": {"Fashion"}, "watch": {"Fashion", "Electronics"},
-    "tv": {"Electronics"}, "television": {"Electronics"}, "headphone": {"Electronics"},
-    "diaper": {"Grocery", "Baby Products"}, "perfume": {"Health & Beauty"},
-    "bike": {"Sporting Goods"}, "yoga": {"Sporting Goods"}, "pot": {"Home & Office"}
+    "shoe": {"Fashion"}, "sneaker": {"Fashion"}, "dress": {"Fashion"},
+    "watch": {"Fashion", "Electronics", "Phones & Tablets"},
+    "tv": {"Electronics"}, "television": {"Electronics"}, "headphone": {"Electronics"}, "camera": {"Electronics"},
+    "diaper": {"Grocery", "Baby Products"}, "perfume": {"Health & Beauty"}, "cologne": {"Health & Beauty"},
+    "trimmer": {"Health & Beauty"}, "clipper": {"Health & Beauty"},
+    "pot": {"Home & Office"}, "glass": {"Home & Office"}, "furniture": {"Home & Office"},
+    "bike": {"Sporting Goods", "Automobile"}, "tweeter": {"Electronics", "Automobile"}
+}
+
+# Texture/Material Words: These cause mismatches if not filtered
+TEXTURE_STOPWORDS = {
+    'canvas', 'wooden', 'bamboo', 'leather', 'plastic', 'silicone', 'metal', 
+    'stainless', 'steel', 'glass', 'clear', 'transparent', 'colored', 'universal'
 }
 
 _MEASURE_RE = re.compile(r'\b\d+\.?\d*\s*(ml|l|g|kg|pcs|inch|cm|w|kw|mah|gb|tb|v|ah)\b', re.I)
@@ -45,7 +54,11 @@ _MEASURE_RE = re.compile(r'\b\d+\.?\d*\s*(ml|l|g|kg|pcs|inch|cm|w|kw|mah|gb|tb|v
 def clean_standard(text):
     if not isinstance(text, str): return ""
     text = text.lower()
+    # Reject noise immediately
+    if text.strip() in ['invalid', 'deleted', 'n/a', 'nan', 'none']: return ""
     text = _MEASURE_RE.sub(" ", text)
+    # Remove material noise that hijacks categories
+    text = " ".join([w for w in text.split() if w not in TEXTURE_STOPWORDS])
     text = re.sub(r'[^a-z0-9\s]', ' ', text)
     return " ".join(text.split()).strip()
 
@@ -71,7 +84,8 @@ def build_index():
     p_clean = df['path_str'].str.replace('/', ' ').str.lower()
     k_clean = df[kw_col].fillna('').astype(str).str.lower() if kw_col else ""
 
-    df['search_text'] = (p_clean + ' ') * 4 + k_clean
+    # Higher weight for Path
+    df['search_text'] = (p_clean + ' ') * 6 + k_clean
 
     vectorizer = TfidfVectorizer(ngram_range=(1, 2), sublinear_tf=True, strip_accents='unicode')
     tfidf_matrix = vectorizer.fit_transform(df['search_text'])
@@ -84,38 +98,45 @@ def build_index():
 df_cat, vectorizer, tfidf_matrix, master_code_map, PATH_COL_NAME = build_index()
 
 # ==============================================================================
-# 4. SCORING ENGINE
+# 4. ENHANCED SCORING ENGINE
 # ==============================================================================
 def calculate_match(clean_q, top_idxs, sims_row, threshold):
+    if not clean_q: return "-", 0.0, "Rejected"
+    
     best_score, best_row = -1.0, None
-    raw_tokens = set(clean_q.split())
+    query_tokens = set(clean_q.split())
     
     required_verticals = set()
-    for tok in raw_tokens:
+    for tok in query_tokens:
         if tok in DOMAIN_SIGNALS:
             required_verticals |= DOMAIN_SIGNALS[tok]
 
     for idx in top_idxs:
         row = df_cat.iloc[idx]
         cos = float(sims_row[idx])
-        name_fuzz = fuzz.token_set_ratio(clean_q, row['leaf_name']) / 100.0
         
+        # Leaf Matching: Does the product contain the actual name of the category?
+        leaf_fuzz = fuzz.token_set_ratio(clean_q, row['leaf_name']) / 100.0
+        
+        # Domain Penalty: Strengthened to 0.35
         top_level = str(row[PATH_COL_NAME]).split('/')[0].strip()
-        penalty = 0.25 if (required_verticals and top_level not in required_verticals) else 0.0
+        penalty = 0.35 if (required_verticals and top_level not in required_verticals) else 0.0
 
-        score = (cos * 0.50) + (name_fuzz * 0.30) + (int(row['depth']) * 0.01) - penalty
+        # Depth Boost for specificity
+        score = (cos * 0.45) + (leaf_fuzz * 0.45) + (int(row['depth']) * 0.02) - penalty
 
         if score > best_score:
             best_score = score
             best_row = row
 
-    if best_row is None: return "Uncategorized", 0.0, "Rejected"
+    if best_row is None: return "-", 0.0, "Rejected"
 
-    conf = round(min(best_score * 120.0, 100.0), 1)
+    conf = round(min(best_score * 115.0, 100.0), 1)
     
-    if conf >= threshold and best_score > 0.22:
+    # Threshold checks
+    if conf >= threshold and best_score > 0.25:
         status = "Approved"
-    elif conf > (threshold - 15):
+    elif conf > (threshold - 10):
         status = "Review"
     else:
         status = "Rejected"
@@ -127,11 +148,11 @@ def calculate_match(clean_q, top_idxs, sims_row, threshold):
 # ==============================================================================
 with st.sidebar:
     st.header("Parameters")
-    threshold = st.slider("Confidence Threshold", 0, 100, 40)
+    threshold = st.slider("Confidence Threshold", 0, 100, 45)
     st.divider()
-    st.info("Highlights differences between original and AI categories.")
+    st.info("Now using Advanced Domain Filtering to prevent 'Blue Cheese/Cologne' style errors.")
 
-uploaded_file = st.file_uploader("Upload CSV", type="csv")
+uploaded_file = st.file_uploader("Upload Product CSV", type="csv")
 
 if uploaded_file:
     df_up = pd.read_csv(uploaded_file, sep=None, engine='python', on_bad_lines='skip')
@@ -140,7 +161,6 @@ if uploaded_file:
     category_col = next((c for c in df_up.columns if "CATEGORY" in c.upper() and "AI" not in c.upper() and "PATH" not in c.upper()), None)
     code_col = next((c for c in df_up.columns if "CODE" in c.upper() and "AI" not in c.upper()), None)
 
-    # Use width='stretch' for the button to resolve the warning
     if st.button("Process Batch Analysis", width="stretch"):
         names = df_up[name_col].fillna("").astype(str).tolist()
         cleaned_queries = [clean_standard(n) for n in names]
@@ -171,26 +191,23 @@ if uploaded_file:
 
         df_up["AI Category"] = df_up.apply(filter_suggestion, axis=1)
 
-        # Standardize Display
         display_map = {name_col: "NAME"}
         if category_col: display_map[category_col] = "CATEGORY"
         df_up = df_up.rename(columns=display_map)
-        
         if "CATEGORY" not in df_up.columns: df_up["CATEGORY"] = "N/A"
 
         final_cols = ["NAME", "Assigned category in full", "CATEGORY", "AI Category", "confidence", "status"]
         
         st.subheader("Analysis Results")
-        # Use width='stretch' for the dataframe to resolve the warning
         st.dataframe(
             df_up[final_cols].head(2000),
             column_config={
                 "confidence": st.column_config.ProgressColumn("Confidence", format="%.1f%%", min_value=0, max_value=100),
-                "Assigned category in full": st.column_config.TextColumn("Current Path", width="large"),
+                "Assigned category in full": st.column_config.TextColumn("Current Category", width="large"),
                 "AI Category": st.column_config.TextColumn("Suggested Change", width="large"),
             },
             width="stretch",
             hide_index=True
         )
         
-        st.download_button("Export Results", df_up[final_cols].to_csv(index=False).encode('utf-8'), "category_audit.csv")
+        st.download_button("Export Results", df_up[final_cols].to_csv(index=False).encode('utf-8'), "category_audit_v2.csv")
