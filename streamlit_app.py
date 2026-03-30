@@ -63,11 +63,9 @@ def build_index():
     df = pd.read_excel(CATEGORY_FILE)
     df.columns = df.columns.str.lower().str.strip().str.replace(' ', '_')
     
-    # Identify path column (Handles different casing)
     path_col = next((c for c in df.columns if 'PATH' in c.upper()), 'category_path')
     df['depth'] = df[path_col].apply(lambda x: str(x).count('/') + 1)
 
-    # Use Path (3x weight) + Cleaned Keywords for the search text
     df['path_clean'] = df[path_col].astype(str).str.replace('/', ' ').str.lower()
     df['kw_clean'] = df['keywords'].fillna('').astype(str).str.lower()
     df['search_text'] = (df['path_clean'] + ' ') * 3 + df['kw_clean']
@@ -75,7 +73,11 @@ def build_index():
     vectorizer = TfidfVectorizer(ngram_range=(1, 2), min_df=1, sublinear_tf=True, strip_accents='unicode')
     tfidf_matrix = vectorizer.fit_transform(df['search_text'])
 
-    code_to_path = dict(zip(df['category_code'].astype(str), df[path_col]))
+    # --- FIX 1: Robust Code Mapping ---
+    # Force codes to be stripped strings (removes .0 and whitespace)
+    df['category_code_str'] = df['category_code'].astype(str).str.replace(r'\.0$', '', regex=True).str.strip()
+    code_to_path = dict(zip(df['category_code_str'], df[path_col]))
+    
     return df, vectorizer, tfidf_matrix, code_to_path, path_col
 
 df_main, vectorizer, tfidf_matrix, master_code_map, PATH_COL_NAME = build_index()
@@ -111,16 +113,19 @@ uploaded_file = st.file_uploader("Upload Product CSV", type="csv")
 if uploaded_file:
     df_up = pd.read_csv(uploaded_file, on_bad_lines='skip')
     name_col = next((c for c in df_up.columns if "NAME" in c.upper()), df_up.columns[0])
+    # Identify the Code column in the uploaded CSV
     code_col = next((c for c in df_up.columns if "CODE" in c.upper() and "MATCH" not in c.upper()), None)
 
     if code_col:
-        df_up["Assigned Path (Original)"] = df_up[code_col].astype(str).map(master_code_map).fillna("⚠️ Unknown Code")
+        # --- FIX 2: Standardize Uploaded Codes ---
+        # Normalize the uploaded code column to match our master dictionary
+        df_up_clean_codes = df_up[code_col].astype(str).str.replace(r'\.0$', '', regex=True).str.strip()
+        df_up["Assigned Path (Original)"] = df_up_clean_codes.map(master_code_map).fillna("⚠️ Unknown Code")
 
     if st.button("Start Analysis 🚀"):
         names = df_up[name_col].fillna("").tolist()
         cleaned_queries = [clean_query(n) for n in names]
         
-        # Matrix Step
         q_vecs = vectorizer.transform(cleaned_queries)
         all_sims = cosine_similarity(q_vecs, tfidf_matrix)
         
@@ -136,7 +141,6 @@ if uploaded_file:
         df_up["Confidence"] = [r[2] for r in results]
         df_up["Status"] = [r[3] for r in results]
 
-        # --- UI DISPLAY CONFIGURATION ---
         st.subheader("📊 Comparison Table")
         
         col_config = {
@@ -147,7 +151,6 @@ if uploaded_file:
             "Confidence": st.column_config.ProgressColumn("Match Score", format="%f%%", min_value=0, max_value=100)
         }
 
-        # Dynamic column selection for display
         final_display_cols = [name_col, "Status", "Assigned Path (Original)", "AI Suggestion", "Confidence"]
         st.dataframe(
             df_up[[c for c in final_display_cols if c in df_up.columns]].head(1000),
