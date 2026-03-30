@@ -26,7 +26,7 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 st.title("Category Test")
-st.caption("Taxonomy Integrity Audit | Strict Threshold Logic | 20% Minimum Floor")
+st.caption("Taxonomy Audit | Rule: Confidence >= 20.0% is Approved")
 
 # ==============================================================================
 # 2. DOMAIN SIGNALS & FILTERS
@@ -39,7 +39,7 @@ DOMAIN_SIGNALS = {
     "shoe": {"Fashion"}, "sneaker": {"Fashion"}, "dress": {"Fashion"},
     "watch": {"Fashion", "Electronics", "Phones & Tablets"},
     "tv": {"Electronics"}, "television": {"Electronics"}, "headphone": {"Electronics"},
-    "diaper": {"Grocery", "Baby Products"}, "perfume": {"Health & Beauty"},
+    "diaper": {"Grocery", "Baby Products"}, "perfume": {"Health & Beauty"}, "foundation": {"Health & Beauty"},
     "bike": {"Sporting Goods", "Automobile"}, "pot": {"Home & Office"}
 }
 
@@ -51,7 +51,7 @@ _MEASURE_RE = re.compile(r'\b\d+\.?\d*\s*(ml|l|g|kg|pcs|inch|cm|w|kw|mah|gb|tb|v
 
 def clean_standard(text):
     if not isinstance(text, str): return ""
-    text = text[:100].lower()
+    text = text[:120].lower()
     text = _MEASURE_RE.sub(" ", text)
     text = re.sub(r'[^a-z0-9\s]', ' ', text)
     return " ".join(text.split()).strip()
@@ -61,87 +61,96 @@ def clean_standard(text):
 # ==============================================================================
 @st.cache_resource(show_spinner="Initializing Taxonomy Index...")
 def build_index():
-    if not os.path.exists(CATEGORY_FILE):
-        st.error(f"Critical Error: {CATEGORY_FILE} not found."); st.stop()
+    try:
+        if not os.path.exists(CATEGORY_FILE):
+            st.error(f"Critical Error: {CATEGORY_FILE} not found."); return None, None, None, None, None
+        df = pd.read_excel(CATEGORY_FILE, engine='openpyxl')
+        df = df.loc[:, ~df.columns.str.contains('^Unnamed')]
+        raw_cols = df.columns.tolist()
+        path_col = next((c for c in raw_cols if 'PATH' in c.upper()), None)
+        kw_col = next((c for c in raw_cols if 'KEY' in c.upper()), None)
+        code_col = next((c for c in raw_cols if 'CODE' in c.upper()), None)
 
-    df = pd.read_excel(CATEGORY_FILE, usecols=lambda c: not str(c).startswith("Unnamed"))
-    raw_cols = df.columns.tolist()
+        df['path_str'] = df[path_col].astype(str)
+        df['leaf_name'] = df['path_str'].apply(lambda x: x.split('/')[-1].strip().lower())
+        df['depth'] = df['path_str'].apply(lambda x: x.count('/') + 1)
+        
+        p_clean = df['path_str'].str.replace('/', ' ').str.lower()
+        k_clean = df[kw_col].fillna('').astype(str).str.lower() if kw_col else ""
+        df['search_text'] = (p_clean + ' ') * 4 + (k_clean + ' ') * 2
 
-    path_col = next((c for c in raw_cols if 'PATH' in c.upper()), None)
-    kw_col = next((c for c in raw_cols if 'KEY' in c.upper()), None)
-    code_col = next((c for c in raw_cols if 'CODE' in c.upper()), None)
+        vectorizer = TfidfVectorizer(ngram_range=(1, 2), sublinear_tf=True, strip_accents='unicode')
+        tfidf_matrix = vectorizer.fit_transform(df['search_text'])
 
-    df['path_str'] = df[path_col].astype(str)
-    df['leaf_name'] = df['path_str'].apply(lambda x: x.split('/')[-1].strip().lower())
-    df['depth'] = df['path_str'].apply(lambda x: x.count('/') + 1)
-    
-    p_clean = df['path_str'].str.replace('/', ' ').str.lower()
-    k_clean = df[kw_col].fillna('').astype(str).str.lower() if kw_col else ""
+        clean_codes = df[code_col].astype(str).str.replace(r'\.0$', '', regex=True).str.strip()
+        code_to_path = dict(zip(clean_codes, df[path_col]))
+        return df, vectorizer, tfidf_matrix, code_to_path, path_col
+    except Exception as e:
+        st.error(f"Initialization Failed: {e}"); return None, None, None, None, None
 
-    df['search_text'] = (p_clean + ' ') * 4 + (k_clean + ' ') * 2
-
-    vectorizer = TfidfVectorizer(ngram_range=(1, 2), sublinear_tf=True, strip_accents='unicode')
-    tfidf_matrix = vectorizer.fit_transform(df['search_text'])
-
-    clean_codes = df[code_col].astype(str).str.replace(r'\.0$', '', regex=True).str.strip()
-    code_to_path = dict(zip(clean_codes, df[path_col]))
-
-    return df, vectorizer, tfidf_matrix, code_to_path, path_col
-
-df_cat, vectorizer, tfidf_matrix, master_code_map, PATH_COL_NAME = build_index()
+index_data = build_index()
+if index_data[0] is not None:
+    df_cat, vectorizer, tfidf_matrix, master_code_map, PATH_COL_NAME = index_data
+else:
+    st.stop()
 
 # ==============================================================================
-# 4. SCORING ENGINE (Simplified Logic)
+# 4. SCORING ENGINE (Optimized for Multi-Word Literal Matches)
 # ==============================================================================
-def calculate_match(clean_q, top_idxs, sims_row, threshold, current_vertical=None):
+def calculate_match(clean_q, top_idxs, sims_row, assigned_path):
     best_score, best_row = -1.0, None
     query_tokens = set(clean_q.split())
+    query_stems = {t.rstrip('s') for t in query_tokens}
     
     required_verticals = set()
     for tok in query_tokens:
         if tok in DOMAIN_SIGNALS:
             required_verticals |= DOMAIN_SIGNALS[tok]
-    if current_vertical: required_verticals.add(current_vertical)
 
     for idx in top_idxs:
         row = df_cat.iloc[idx]
         cos = float(sims_row[idx])
         path_str = str(row[PATH_COL_NAME])
         top_level = path_str.split("/")[0].strip()
+        leaf = row['leaf_name']
+        
+        # ⚓ SMART LITERAL MATCH (Smart TV / Foundation fix)
+        literal_boost = 0.0
+        leaf_words = [w.rstrip('s') for w in leaf.replace('&', ' ').split() if len(w) >= 2]
+        if leaf_words and all(lw in query_stems for lw in leaf_words):
+            literal_boost = 0.60 
         
         path_tokens = set(path_str.lower().replace("/", " ").split())
         coverage = len(query_tokens & path_tokens) / max(len(query_tokens), 1)
-
         penalty = 0.40 if (required_verticals and top_level not in required_verticals) else 0.0
-        score = (cos * 0.40) + (fuzz.token_set_ratio(clean_q, row['leaf_name'])/100 * 0.40) + (coverage * 0.20) - penalty
+
+        score = (cos * 0.40) + (fuzz.token_set_ratio(clean_q, leaf)/100 * 0.40) + (coverage * 0.20) + literal_boost - penalty
 
         if score > best_score:
             best_score = score
             best_row = row
 
-    if best_row is None: return "-", 0.0, "Rejected"
+    if best_row is None: return 0.0, "Rejected"
 
-    # Confidence calculation scaled to 100%
-    conf = round(min(max(best_score * 160.0, 0.0), 100.0), 1)
+    conf = round(min(max(best_score * 150.0, 0.0), 100.0), 1)
     
-    # NEW SIMPLIFIED LOGIC:
-    # 1. Must be >= 20.0 (The Hard Floor you requested)
-    # 2. Must be >= threshold (The Slider)
-    if conf >= 20.0 and conf >= threshold:
+    # RULE: No product above 20 should be rejected
+    if conf >= 20.0:
         status = "Approved"
     else:
         status = "Rejected"
     
-    return best_row[PATH_COL_NAME], conf, status
+    return conf, status
 
 # ==============================================================================
 # 5. UI & BATCH PROCESSING
 # ==============================================================================
 with st.sidebar:
     st.header("Parameters")
-    threshold = st.slider("Confidence Threshold", 0, 100, 40)
+    # Slider is returned but logic follows the 20.0% hard floor
+    threshold_slider = st.slider("Visual Filter", 0, 100, 20)
     st.divider()
-    st.caption("Matches below 20% or your slider are Rejected.")
+    st.caption("Standard: Any score above 20.0% is marked as Approved.")
 
 uploaded_file = st.file_uploader("Upload Product CSV", type="csv")
 
@@ -154,12 +163,8 @@ if uploaded_file:
 
     if st.button("Process Batch Analysis", width="stretch"):
         names = df_up[name_col].fillna("").astype(str).tolist()
-        
         invalid_mask = [is_invalid_name(n) for n in names]
         cleaned_queries = [clean_standard(n) if not inv else "" for n, inv in zip(names, invalid_mask)]
-        
-        q_vecs = vectorizer.transform(cleaned_queries)
-        all_sims = cosine_similarity(q_vecs, tfidf_matrix)
         
         if code_col:
             clean_codes = df_up[code_col].astype(str).str.replace(r'\.0$', '', regex=True).str.strip()
@@ -167,23 +172,24 @@ if uploaded_file:
         else:
             df_up["Assigned category in full"] = "N/A"
 
-        existing_verticals = [str(p).split('/')[0].strip() if p not in ("N/A", "Unknown Code") else None for p in df_up["Assigned category in full"]]
-
+        q_vecs = vectorizer.transform(cleaned_queries)
+        all_sims = cosine_similarity(q_vecs, tfidf_matrix)
+        
         results = []
         for i in range(len(names)):
             if invalid_mask[i]:
-                results.append(("-", 0.0, "Rejected"))
+                results.append((0.0, "Rejected"))
                 continue
             s_row = all_sims[i]
             t_idxs = np.argpartition(s_row, -40)[-40:]
-            results.append(calculate_match(cleaned_queries[i], t_idxs, s_row, threshold, existing_verticals[i]))
+            results.append(calculate_match(cleaned_queries[i], t_idxs, s_row, df_up["Assigned category in full"].iloc[i]))
 
-        df_up["confidence"] = [r[1] for r in results]
-        df_up["status"] = [r[2] for r in results]
+        df_up["confidence"] = [r[0] for r in results]
+        df_up["status"] = [r[1] for r in results]
 
-        display_map = {name_col: "NAME"}
-        if category_col: display_map[category_col] = "CATEGORY"
-        df_up = df_up.rename(columns=display_map)
+        # Rename for requested columns
+        df_up = df_up.rename(columns={name_col: "NAME"})
+        if category_col: df_up = df_up.rename(columns={category_col: "CATEGORY"})
         if "CATEGORY" not in df_up.columns: df_up["CATEGORY"] = "N/A"
 
         final_cols = ["NAME", "Assigned category in full", "CATEGORY", "confidence", "status"]
@@ -192,8 +198,8 @@ if uploaded_file:
         st.dataframe(
             df_up[final_cols].head(2000),
             column_config={
-                "confidence": st.column_config.ProgressColumn("Confidence", format="%.1f%%", min_value=0, max_value=100),
-                "Assigned category in full": st.column_config.TextColumn("Current Category Path", width="large"),
+                "confidence": st.column_config.ProgressColumn("Score", format="%.1f%%", min_value=0, max_value=100),
+                "Assigned category in full": st.column_config.TextColumn("Current Category", width="large"),
             },
             width="stretch",
             hide_index=True
