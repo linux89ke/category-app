@@ -1,9 +1,6 @@
 streamlit
 pandas
 numpy
-sentence-transformers
-torch
-torchvision
-faiss-cpu
-openpyxl
+scikit-learn
 rapidfuzz
+openpyxl
