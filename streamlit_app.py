@@ -26,7 +26,7 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 st.title("Category Test")
-st.caption("Taxonomy Integrity Audit | Hard Safety Floor (20%) | Domain Guardrails")
+st.caption("Taxonomy Integrity Audit | Strict Threshold Logic | 20% Minimum Floor")
 
 # ==============================================================================
 # 2. DOMAIN SIGNALS & FILTERS
@@ -91,7 +91,7 @@ def build_index():
 df_cat, vectorizer, tfidf_matrix, master_code_map, PATH_COL_NAME = build_index()
 
 # ==============================================================================
-# 4. SCORING ENGINE (With 20% Hard Floor)
+# 4. SCORING ENGINE (Simplified Logic)
 # ==============================================================================
 def calculate_match(clean_q, top_idxs, sims_row, threshold, current_vertical=None):
     best_score, best_row = -1.0, None
@@ -121,12 +121,13 @@ def calculate_match(clean_q, top_idxs, sims_row, threshold, current_vertical=Non
 
     if best_row is None: return "-", 0.0, "Rejected"
 
+    # Confidence calculation scaled to 100%
     conf = round(min(max(best_score * 160.0, 0.0), 100.0), 1)
     
-    # Logic: Reject if confidence is below 20, regardless of threshold slider
-    if conf < 20.0:
-        status = "Rejected"
-    elif conf >= threshold and best_score > 0.28:
+    # NEW SIMPLIFIED LOGIC:
+    # 1. Must be >= 20.0 (The Hard Floor you requested)
+    # 2. Must be >= threshold (The Slider)
+    if conf >= 20.0 and conf >= threshold:
         status = "Approved"
     else:
         status = "Rejected"
@@ -138,9 +139,9 @@ def calculate_match(clean_q, top_idxs, sims_row, threshold, current_vertical=Non
 # ==============================================================================
 with st.sidebar:
     st.header("Parameters")
-    threshold = st.slider("Confidence Threshold", 0, 100, 60)
+    threshold = st.slider("Confidence Threshold", 0, 100, 40)
     st.divider()
-    st.caption("Assignments with < 20% confidence are automatically rejected.")
+    st.caption("Matches below 20% or your slider are Rejected.")
 
 uploaded_file = st.file_uploader("Upload Product CSV", type="csv")
 
