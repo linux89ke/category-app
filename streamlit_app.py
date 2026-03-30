@@ -26,7 +26,7 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 st.title("Category Test")
-st.caption("Standardized Taxonomy Audit Engine | Version 2026.4")
+st.caption("Standardized Taxonomy Audit Engine | Version 2026.6")
 
 # ==============================================================================
 # 2. INVALID NAME FILTER
@@ -149,7 +149,9 @@ DOMAIN_SIGNALS = {
     # Toys & Games
     "toy": {"Toys & Games"}, "puzzle": {"Toys & Games"},
     "lego": {"Toys & Games"}, "doll": {"Toys & Games"},
-    "jenga": {"Toys & Games"},
+    "jenga": {"Toys & Games"}, "tricycle": {"Toys & Games", "Sporting Goods"},
+    "trike": {"Toys & Games", "Sporting Goods"}, "scooter": {"Toys & Games"},
+    "skateboard": {"Toys & Games"}, "wagon": {"Toys & Games"},
 
     # Pet Supplies
     "harness": {"Pet Supplies"}, "leash": {"Pet Supplies"},
@@ -178,6 +180,9 @@ def clean_standard(text):
     text = text[:NAME_TRUNCATE]
     text = text.lower()
     text = _MEASURE_RE.sub(" ", text)
+    # Join hyphenated/spaced compounds before stripping punctuation:
+    # "TRI- CYCLE" → "tricycle", "HIGH-POWER" → "highpower"
+    text = re.sub(r'(?<=[a-z0-9])[-\s]*-\s*(?=[a-z0-9])', '', text)
     text = re.sub(r'[^a-z0-9\s]', ' ', text)
     return " ".join(text.split()).strip()
 
@@ -261,6 +266,13 @@ def calculate_match(clean_q, top_idxs, sims_row, threshold, current_vertical=Non
         cos       = float(sims_row[idx])
         name_fuzz = fuzz.token_set_ratio(clean_q, row["leaf_name"]) / 100.0
 
+        # Path coverage: ratio of product name tokens that actually appear in the category path.
+        # Replaces the blind depth bonus — a deeper node only wins if more of the
+        # product name is covered by the path, not just because it goes deeper.
+        path_tokens  = set(path_str.lower().replace("/", " ").split())
+        name_tokens  = set(clean_q.split())
+        coverage     = len(name_tokens & path_tokens) / max(len(name_tokens), 1)
+
         # Domain penalty -0.50 — makes cross-vertical wins very hard
         penalty = 0.50 if (required_verticals and top_level not in required_verticals) else 0.0
 
@@ -268,11 +280,12 @@ def calculate_match(clean_q, top_idxs, sims_row, threshold, current_vertical=Non
         ambiguity_count   = int(row.get("leaf_ambiguity", 1))
         ambiguity_penalty = min((ambiguity_count - 1) * 0.002, 0.10)
 
-        # TF-IDF 0.45 / Leaf name 0.45 — balanced, leaf name gets more weight than before
+        # TF-IDF 0.40 / Leaf name 0.40 / Path coverage 0.20
+        # Coverage replaces the old blind depth bonus — deeper only wins if it fits better
         score = (
-            (cos       * 0.45) +
-            (name_fuzz * 0.45) +
-            (depth     * 0.01) -
+            (cos       * 0.40) +
+            (name_fuzz * 0.40) +
+            (coverage  * 0.20) -
             penalty -
             ambiguity_penalty -
             misc_penalty
