@@ -1,514 +1,929 @@
 """
 Product Category Predictor
-Strategy : TF-IDF shortlist (instant) + async parallel Groq reranking
-Speed    : all products run concurrently, ~2-5s for any batch size
-Cost     : 1 Groq call per product
+Hybrid Flow: Cache → Local ML → TF-IDF Gate → Batched Groq
 """
 
-import os, io, json, asyncio
+import os, json, asyncio, pickle, re, math
 import numpy as np
-import openpyxl
 import streamlit as st
 import pandas as pd
 import plotly.graph_objects as go
+from collections import defaultdict
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.metrics.pairwise import cosine_similarity
-from groq import AsyncGroq
+from sklearn.linear_model import LogisticRegression
+from sklearn.preprocessing import LabelEncoder
+from groq import AsyncGroq, Groq
+from tenacity import retry, stop_after_attempt, wait_exponential
 
-st.set_page_config(page_title="Product Category Predictor", page_icon="🏷️",
-                   layout="wide", initial_sidebar_state="expanded")
+# ─────────────────────────────────────────────
+# CONFIG
+# ─────────────────────────────────────────────
+
+CACHE_FILE      = "prediction_cache.json"
+INDEX_FILE      = "category_index.pkl"
+CLASSIFIER_FILE = "category_classifier.pkl"
+CACHE_VERSION   = "v6"
+
+# Tunable thresholds
+TFIDF_CONFIDENCE_THRESHOLD      = 0.55   # skip AI if top TF-IDF score > this
+CLASSIFIER_CONFIDENCE_THRESHOLD = 0.70   # skip AI if classifier prob > this
+CLASSIFIER_MIN_SAMPLES          = 50     # min cache entries before classifier trains
+BATCH_SIZE                      = 10     # products per single Groq call
+
+st.set_page_config(page_title="CatPredict", layout="wide", initial_sidebar_state="expanded")
+
+# ─────────────────────────────────────────────
+# STYLES
+# ─────────────────────────────────────────────
 
 st.markdown("""
 <style>
-    .main-title {
-        font-size:2.4rem; font-weight:700;
-        background:linear-gradient(90deg,#f55036 0%,#ff8c00 100%);
-        -webkit-background-clip:text; -webkit-text-fill-color:transparent;
-        margin-bottom:0.2rem;
-    }
-    .subtitle { color:#888; font-size:1rem; margin-bottom:1.5rem; }
-    .result-card {
-        background:#f8f9fc; border-left:4px solid #f55036;
-        padding:0.8rem 1rem; border-radius:0 8px 8px 0; margin-bottom:0.5rem;
-    }
-    .stTextArea textarea { border-radius:10px !important; border:2px solid #e0e0f0 !important; }
-    .stTextArea textarea:focus { border-color:#f55036 !important; }
-    .speed-badge {
-        display:inline-block; background:#e6f4ea; color:#1e7e34;
-        font-size:0.75rem; font-weight:700; padding:2px 10px;
-        border-radius:20px; margin-left:8px;
-    }
+@import url('https://fonts.googleapis.com/css2?family=Syne:wght@400;600;700;800&family=DM+Mono:wght@300;400;500&display=swap');
+
+html, body, [class*="css"] { font-family:'DM Mono',monospace; }
+#MainMenu, footer, header { visibility:hidden; }
+.block-container { padding-top:1.5rem; padding-bottom:2rem; }
+
+.app-header { display:flex; align-items:baseline; gap:12px; margin-bottom:.25rem; }
+.app-title  { font-family:'Syne',sans-serif; font-size:2rem; font-weight:800; color:#f55036; letter-spacing:-.03em; line-height:1; }
+.app-sub    { font-family:'DM Mono',monospace; font-size:.75rem; color:#555; letter-spacing:.05em; text-transform:uppercase; }
+
+.stat-row  { display:flex; gap:12px; margin:1rem 0 1.5rem; flex-wrap:wrap; }
+.stat-card { background:#0d0d0d; border:1px solid #1e1e1e; border-radius:8px; padding:14px 20px; min-width:130px; flex:1; }
+.stat-val  { font-family:'Syne',sans-serif; font-size:1.6rem; font-weight:700; color:#f55036; line-height:1; }
+.stat-lbl  { font-size:.62rem; color:#444; text-transform:uppercase; letter-spacing:.08em; margin-top:4px; }
+
+.result-card { background:#090909; border:1px solid #1e1e1e; border-left:3px solid #f55036; border-radius:8px; padding:18px 22px; margin-top:.75rem; }
+.result-lbl  { font-size:.62rem; color:#444; text-transform:uppercase; letter-spacing:.1em; margin-bottom:8px; }
+.result-cat  { font-family:'Syne',sans-serif; font-size:1.1rem; font-weight:600; color:#f0f0f0; word-break:break-word; }
+.result-meta { font-size:.65rem; color:#444; margin-top:8px; }
+
+/* source badges */
+.badge { display:inline-block; font-size:.6rem; padding:2px 8px; border-radius:20px; letter-spacing:.08em; margin-bottom:8px; }
+.badge-cache      { background:#0a1a0a; border:1px solid #1a3a1a; color:#4caf72; }
+.badge-classifier { background:#0a0f1a; border:1px solid #1a2a3a; color:#4a9ef5; }
+.badge-tfidf      { background:#1a1a0a; border:1px solid #3a3a1a; color:#d4c44a; }
+.badge-ai         { background:#1a0d08; border:1px solid #3a1a0a; color:#f55036; }
+
+/* flow diagram */
+.flow-step { display:inline-flex; align-items:center; gap:6px; padding:6px 12px; border-radius:6px; font-size:.68rem; }
+.flow-hit  { background:#0a1a0a; border:1px solid #1a3a1a; color:#4caf72; }
+.flow-skip { background:#111; border:1px solid #1e1e1e; color:#333; }
+.flow-arrow { color:#333; font-size:.8rem; }
+
+.sec-lbl { font-size:.62rem; text-transform:uppercase; letter-spacing:.1em; color:#333; margin-bottom:.5rem; }
+
+button[data-baseweb="tab"] { font-family:'DM Mono',monospace !important; font-size:.75rem !important; text-transform:uppercase; letter-spacing:.08em; }
+button[data-baseweb="tab"][aria-selected="true"] { color:#f55036 !important; border-bottom-color:#f55036 !important; }
+
+section[data-testid="stSidebar"] { background:#070707; border-right:1px solid #111; }
+section[data-testid="stSidebar"] label { font-family:'DM Mono',monospace !important; font-size:.68rem !important; text-transform:uppercase; letter-spacing:.07em; color:#444 !important; }
+
+.stProgress > div > div { background-color:#f55036 !important; }
+[data-testid="stFileUploadDropzone"] { border:1px dashed #1e1e1e !important; border-radius:8px !important; background:#070707 !important; }
 </style>
 """, unsafe_allow_html=True)
 
+# ─────────────────────────────────────────────
+# HEADER
+# ─────────────────────────────────────────────
 
-# ─── TF-IDF index ─────────────────────────────────────────────────────────────
+st.markdown("""
+<div class="app-header">
+  <span class="app-title">CATPREDICT</span>
+  <span class="app-sub">/ hybrid category intelligence</span>
+</div>
+""", unsafe_allow_html=True)
 
-def path_to_doc(path: str) -> str:
-    parts = path.split(" / ")
-    return " ".join(parts) + " " + " ".join(parts[-3:]) * 2
-
-
-@st.cache_resource(show_spinner=False)
-def build_index(file_bytes: bytes):
-    wb = openpyxl.load_workbook(io.BytesIO(file_bytes))
-    ws = wb.active
-    all_paths = [row[2] for row in ws.iter_rows(min_row=2, values_only=True) if row[2]]
-    path_set  = set(all_paths)
-    leaves    = [p for p in all_paths
-                 if not any(other.startswith(p + " / ") for other in path_set)]
-    docs      = [path_to_doc(p) for p in leaves]
-    vectorizer = TfidfVectorizer(ngram_range=(1, 2), min_df=1, sublinear_tf=True)
-    matrix    = vectorizer.fit_transform(docs)
-    return leaves, vectorizer, matrix, all_paths
-
-
-def shortlist(query: str, leaves, vectorizer, matrix, k: int = 30) -> list[str]:
-    qvec = vectorizer.transform([query])
-    sims = cosine_similarity(qvec, matrix)[0]
-    top_idx = np.argsort(sims)[::-1][:k]
-    return [leaves[i] for i in top_idx if sims[i] > 0]
-
-
-def batch_shortlist(queries: list[str], leaves, vectorizer, matrix, k: int = 30) -> list[list[str]]:
-    """Vectorise all queries in one matrix op — much faster than looping."""
-    qmat = vectorizer.transform(queries)
-    sims = cosine_similarity(qmat, matrix)          # (n_queries, n_leaves)
-    results = []
-    for row in sims:
-        top_idx = np.argsort(row)[::-1][:k]
-        results.append([leaves[i] for i in top_idx if row[i] > 0])
-    return results
-
-
-# ─── Async Groq reranking ─────────────────────────────────────────────────────
-
-SYSTEM_TEMPLATE = """You are a product categorization expert.
-Given a product title and a list of candidate category paths, pick the {top_n} best matching categories.
-Consider brand, product type, gender, style, material.
-
-Respond with JSON only:
-{{
-  "categories": [
-    {{"category": "<full path>", "score": 0.95}},
-    ...
-  ]
-}}
-
-Rules:
-- Return exactly {top_n} categories ordered by confidence descending
-- Only pick from the provided candidate list — never invent categories
-- Scores are floats 0.0–1.0
-- JSON only, nothing else"""
-
-
-async def async_rerank(
-    idx: int,
-    query: str,
-    candidates: list[str],
-    client: AsyncGroq,
-    model: str,
-    top_n: int,
-    semaphore: asyncio.Semaphore,
-) -> tuple[int, list[dict]]:
-    """Rerank candidates for a single product. Returns (original_index, results)."""
-    async with semaphore:
-        cand_list = "\n".join(f"- {c}" for c in candidates)
-        try:
-            resp = await client.chat.completions.create(
-                model=model,
-                temperature=0.1,
-                response_format={"type": "json_object"},
-                messages=[
-                    {"role": "system",
-                     "content": SYSTEM_TEMPLATE.format(top_n=top_n)},
-                    {"role": "user",
-                     "content": f"Product: {query}\n\nCandidates:\n{cand_list}"},
-                ],
-            )
-            raw  = resp.choices[0].message.content.strip()
-            data = json.loads(raw).get("categories", [])
-            return idx, data
-        except Exception as e:
-            return idx, [{"category": f"ERROR: {e}", "score": 0.0}]
-
-
-async def parallel_predict(
-    queries: list[str],
-    candidates_list: list[list[str]],
-    api_key: str,
-    model: str,
-    top_n: int,
-    concurrency: int,
-) -> list[list[dict]]:
-    """Fire all Groq calls concurrently, bounded by semaphore."""
-    client    = AsyncGroq(api_key=api_key)
-    semaphore = asyncio.Semaphore(concurrency)
-    tasks     = [
-        async_rerank(i, q, c, client, model, top_n, semaphore)
-        for i, (q, c) in enumerate(zip(queries, candidates_list))
-    ]
-    results_raw = await asyncio.gather(*tasks)
-    # Re-sort by original index (gather preserves order but let's be safe)
-    ordered = sorted(results_raw, key=lambda x: x[0])
-    return [r for _, r in ordered]
-
-
-def run_parallel(queries, candidates_list, api_key, model, top_n, concurrency):
-    """Streamlit-safe wrapper — creates a fresh event loop."""
-    return asyncio.run(
-        parallel_predict(queries, candidates_list, api_key, model, top_n, concurrency)
-    )
-
-
-# ─── Sync single predict (for single tab) ────────────────────────────────────
-
-def sync_rerank(query, candidates, api_key, model, top_n):
-    from groq import Groq
-    client    = Groq(api_key=api_key)
-    cand_list = "\n".join(f"- {c}" for c in candidates)
-    resp = client.chat.completions.create(
-        model=model,
-        temperature=0.1,
-        response_format={"type": "json_object"},
-        messages=[
-            {"role": "system", "content": SYSTEM_TEMPLATE.format(top_n=top_n)},
-            {"role": "user",   "content": f"Product: {query}\n\nCandidates:\n{cand_list}"},
-        ],
-    )
-    return json.loads(resp.choices[0].message.content.strip()).get("categories", [])
-
-
-# ─── Result renderer ──────────────────────────────────────────────────────────
-
-def render_results(preds, score_threshold, show_chart, show_hierarchy):
-    preds = [p for p in preds if p.get("score", 0) >= score_threshold]
-    if not preds:
-        st.warning("No categories above the confidence threshold.")
-        return
-
-    left, right = (st.columns([1, 1]) if show_chart else (st, None))
-
-    with left:
-        st.markdown("#### 🎯 Top Predictions")
-        for i, p in enumerate(preds):
-            pct   = p["score"] * 100
-            color = "#f55036" if pct > 60 else "#ff8c00" if pct > 30 else "#ffd580"
-            st.markdown(f"""
-            <div class="result-card">
-              <span style="font-size:.72rem;font-weight:700;color:#f55036;text-transform:uppercase;">#{i+1}</span>
-              <div style="font-size:1rem;font-weight:600;color:#1a1a2e;">{p['category']}</div>
-              <div style="display:flex;align-items:center;gap:8px;margin-top:4px;">
-                <div style="flex:1;height:6px;background:#e8eaf6;border-radius:3px;">
-                  <div style="width:{int(pct)}%;height:100%;background:{color};border-radius:3px;"></div>
-                </div>
-                <span style="font-size:.88rem;color:#555;">{pct:.1f}%</span>
-              </div>
-            </div>""", unsafe_allow_html=True)
-
-    if show_chart and right:
-        with right:
-            st.markdown("#### 📊 Confidence Chart")
-            df = pd.DataFrame(preds).sort_values("score")
-            df["label"] = df["category"].apply(
-                lambda x: " / ".join(x.split(" / ")[-2:]) if " / " in x else x)
-            fig = go.Figure(go.Bar(
-                x=df["score"]*100, y=df["label"], orientation="h",
-                marker=dict(color=df["score"]*100,
-                            colorscale=[[0,"#ffd580"],[0.5,"#ff8c00"],[1,"#f55036"]],
-                            showscale=False),
-                text=[f"{s*100:.1f}%" for s in df["score"]],
-                textposition="outside",
-                hovertext=df["category"], hoverinfo="text+x",
-            ))
-            fig.update_layout(
-                xaxis_title="Confidence (%)",
-                margin=dict(l=0, r=60, t=10, b=30),
-                height=max(300, len(preds)*36),
-                plot_bgcolor="rgba(0,0,0,0)", paper_bgcolor="rgba(0,0,0,0)",
-                xaxis=dict(range=[0, 115]),
-            )
-            st.plotly_chart(fig, use_container_width=True)
-
-    if show_hierarchy:
-        lines, seen = [], set()
-        for p in preds:
-            parts = [x.strip() for x in p["category"].split(" / ") if x.strip()]
-            if len(parts) > 1:
-                if parts[0] not in seen:
-                    lines.append(f"📁 **{parts[0]}**")
-                    seen.add(parts[0])
-                for d, part in enumerate(parts[1:], 1):
-                    lines.append(f"{'  '*d}└─ {part}")
-            else:
-                lines.append(f"🏷️ {p['category']}")
-        if lines:
-            st.markdown("#### 🌲 Category Hierarchy")
-            st.markdown("\n".join(lines))
-
-
-# ─── Sidebar ──────────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────
+# SIDEBAR
+# ─────────────────────────────────────────────
 
 with st.sidebar:
-    st.markdown("## 🔑 Groq API Key")
-    api_key = st.text_input("Paste your key here:",
-                            value=os.environ.get("GROQ_API_KEY", ""),
-                            type="password", placeholder="gsk_…")
-    st.caption("Free key at [console.groq.com](https://console.groq.com)")
+    st.markdown('<p style="font-family:Syne,sans-serif;font-weight:700;font-size:.95rem;color:#f55036;margin-bottom:1rem;">⚙ CONFIG</p>', unsafe_allow_html=True)
 
-    st.markdown("---")
-    st.markdown("## 📂 Category Map")
-    cat_file = st.file_uploader("Upload category_map.xlsx", type=["xlsx"])
-    if cat_file:
-        st.success(f"✅ {cat_file.name} loaded")
+    try:
+        api_key = st.secrets.get("GROQ_API_KEY") or os.environ.get("GROQ_API_KEY")
+    except Exception:
+        api_key = os.environ.get("GROQ_API_KEY")
 
-    st.markdown("---")
-    st.markdown("## ⚙️ Settings")
-    model_choice = st.selectbox(
-        "Groq model",
-        ["llama-3.1-8b-instant", "llama-3.3-70b-versatile", "mixtral-8x7b-32768"],
-        index=0,
-        help="8b is fastest & free. 70b is most accurate.",
-    )
-    top_n        = st.slider("Top N results", 1, 10, 5)
-    shortlist_k  = st.slider("Shortlist size", 10, 50, 30,
-                             help="Candidates sent to Groq per product. 30 is optimal.")
-    concurrency  = st.slider("Parallel requests", 1, 30, 10,
-                             help="How many Groq calls run simultaneously. Free tier: keep ≤ 30.")
-    score_threshold = st.slider("Min confidence", 0.0, 1.0, 0.0, 0.05)
-    show_chart   = st.checkbox("Show confidence chart", value=True)
-    show_hierarchy = st.checkbox("Show category hierarchy", value=True)
+    manual_key = st.text_input("API Key Override", type="password", placeholder="gsk_...")
+    if manual_key:
+        api_key = manual_key
 
-    st.markdown("---")
-    st.markdown("""### ℹ️ How it works
-**Step 1 — TF-IDF** (free, ~10ms total for any batch)
-Shortlists 30 leaf candidates per product in one matrix op.
+    if api_key:
+        st.markdown('<p style="color:#4caf72;font-size:.7rem;">● KEY ACTIVE</p>', unsafe_allow_html=True)
+    else:
+        st.markdown('<p style="color:#f55036;font-size:.7rem;">● NO KEY — AI DISABLED</p>', unsafe_allow_html=True)
 
-**Step 2 — Groq async** (all products fire simultaneously)
-Parallel calls return together in ~2s regardless of batch size.
+    st.divider()
+    model_choice = st.selectbox("Model", ["llama-3.1-8b-instant", "llama-3.3-70b-versatile"])
+    shortlist_k  = st.slider("Candidate Shortlist", 5, 50, 20)
+    concurrency  = st.slider("Parallel Workers", 1, 20, 5)
+    batch_size   = st.slider("Products per API Call", 1, 20, BATCH_SIZE)
 
-**Result:** 100 products in ~5s instead of ~200s.""")
+    st.divider()
+    st.markdown('<p class="sec-lbl">Confidence Thresholds</p>', unsafe_allow_html=True)
+    tfidf_thresh = st.slider("TF-IDF Gate", 0.0, 1.0, TFIDF_CONFIDENCE_THRESHOLD, 0.05,
+                             help="Skip AI if top TF-IDF similarity exceeds this")
+    clf_thresh   = st.slider("Classifier Gate", 0.0, 1.0, CLASSIFIER_CONFIDENCE_THRESHOLD, 0.05,
+                             help="Skip AI if local classifier confidence exceeds this")
 
+    st.divider()
+    cache_data = {}
+    if os.path.exists(CACHE_FILE):
+        try:
+            cache_data = json.load(open(CACHE_FILE))
+        except Exception:
+            pass
 
-# ─── Main ─────────────────────────────────────────────────────────────────────
+    st.markdown(
+        f'<p style="font-family:Syne,sans-serif;font-size:1.3rem;font-weight:700;color:#f55036;margin-bottom:0;">{len(cache_data)}</p>'
+        f'<p style="font-size:.62rem;color:#333;text-transform:uppercase;letter-spacing:.08em;margin-top:2px;">CACHED PREDICTIONS</p>',
+        unsafe_allow_html=True,
+    )
 
-st.markdown('<p class="main-title">🏷️ Product Category Predictor</p>', unsafe_allow_html=True)
-st.markdown('<p class="subtitle">TF-IDF shortlist + async parallel Groq — fast, accurate, 1 API call per product.</p>', unsafe_allow_html=True)
+    if st.button("Retrain Classifier", use_container_width=True):
+        if os.path.exists(CLASSIFIER_FILE):
+            os.remove(CLASSIFIER_FILE)
+        st.rerun()
 
-if not api_key:
-    st.info("👈 Enter your Groq API key in the sidebar.")
-    st.stop()
-if not cat_file:
-    st.info("👈 Upload your `category_map.xlsx` in the sidebar.")
-    st.stop()
+    if st.button("Clear All Cache", use_container_width=True):
+        for f in [CACHE_FILE, INDEX_FILE, CLASSIFIER_FILE]:
+            if os.path.exists(f):
+                os.remove(f)
+        st.rerun()
 
-with st.spinner("Building category index (one-time ~2s)…"):
-    file_bytes = cat_file.read()
-    leaves, vectorizer, matrix, all_paths = build_index(file_bytes)
+# ─────────────────────────────────────────────
+# FILE HANDLING
+# ─────────────────────────────────────────────
 
-st.success(f"✅ {len(leaves):,} leaf categories indexed")
+map_file = None
+for f in ["category_map1.csv", "category_map1.xlsx", "category_map1.xlsx - pim category attribute set.csv"]:
+    if os.path.exists(f):
+        map_file = f
+        break
 
-# ─── Tabs ─────────────────────────────────────────────────────────────────────
+if not map_file:
+    st.divider()
+    st.markdown('<p style="font-family:Syne,sans-serif;font-weight:700;color:#f0f0f0;">No Category Map Found</p>', unsafe_allow_html=True)
+    st.caption("Upload a CSV or Excel file — category paths in column 3.")
+    up = st.file_uploader("Upload category file", type=["csv", "xlsx"])
+    if up:
+        df_up = pd.read_excel(up) if up.name.endswith(".xlsx") else pd.read_csv(up)
+        df_up.to_csv("category_map1.csv", index=False)
+        st.success("✓ Uploaded — reloading...")
+        st.rerun()
+    st.stop()
 
-tab_single, tab_batch, tab_explore = st.tabs(["🔍 Single Predict", "📦 Batch Predict", "🗂️ Explore"])
+# ─────────────────────────────────────────────
+# INDEX
+# ─────────────────────────────────────────────
 
-EXAMPLES = [
-    "Baggy Unit Denim Jeans Men's Streetwear",
-    "AirPods Pro 2nd Generation Wireless Earbuds",
-    "LEGO Star Wars Skywalker Saga Nintendo Switch",
-    "KitchenAid 5-Quart Artisan Stand Mixer",
-    "Harry Potter Sorcerer's Stone Hardcover",
-    "Hydro Boost Face Moisturizer SPF 25",
-]
+def _build_index(path):
+    df    = pd.read_csv(path) if path.endswith(".csv") else pd.read_excel(path)
+    paths = df.iloc[:, 2].dropna().astype(str).tolist()
+    pset  = set(paths)
+    leaves = [p for p in paths if not any(o.startswith(p + " / ") for o in pset)]
+    docs   = [" ".join(p.split(" / ")) for p in leaves]
+    vec    = TfidfVectorizer(ngram_range=(1, 2))
+    mat    = vec.fit_transform(docs)
+    return (leaves, vec, mat, df, paths)
 
-# ── Single ─────────────────────────────────────────────────────────────────────
-with tab_single:
-    st.markdown("### Enter a product title")
-    st.markdown("**Quick examples:**")
-    cols = st.columns(3)
-    for i, ex in enumerate(EXAMPLES):
-        short = ex[:46] + "…" if len(ex) > 46 else ex
-        if cols[i % 3].button(short, key=f"ex_{i}", use_container_width=True):
-            st.session_state["product_text"] = ex
+@st.cache_resource
+def load_index(path, ver):
+    if os.path.exists(INDEX_FILE):
+        try:
+            with open(INDEX_FILE, "rb") as fh:
+                saved_ver, data = pickle.load(fh)
+            if saved_ver == ver and isinstance(data, tuple) and len(data) == 5:
+                return data
+        except Exception:
+            pass
+    data = _build_index(path)
+    try:
+        with open(INDEX_FILE, "wb") as fh:
+            pickle.dump((ver, data), fh)
+    except Exception:
+        pass
+    return data
 
-    col_title, col_brand = st.columns([3, 1])
-    with col_title:
-        product_text = st.text_area(
-            "Product title",
-            value=st.session_state.get("product_text", ""),
-            height=90,
-            placeholder="e.g. Air Max 270 Men's Running Shoes…",
-        )
-    with col_brand:
-        brand = st.text_input(
-            "Brand *(optional)*",
-            placeholder="e.g. Nike",
-            help="Helps Groq disambiguate — e.g. Apple → Electronics not Grocery.",
-        )
+leaves, vectorizer, matrix, raw_df, all_paths = load_index(map_file, CACHE_VERSION)
 
-    if st.button("🔍 Predict", type="primary", use_container_width=True):
-        if product_text.strip():
-            query = f"{brand.strip()} {product_text.strip()}".strip() if brand.strip() else product_text.strip()
-            with st.spinner("Shortlisting…"):
-                candidates = shortlist(query, leaves, vectorizer, matrix, shortlist_k)
-            with st.spinner(f"Asking Groq ({len(candidates)} candidates)…"):
-                try:
-                    preds = sync_rerank(query, candidates, api_key, model_choice, top_n)
-                    render_results(preds, score_threshold, show_chart, show_hierarchy)
-                    with st.expander(f"🔎 {len(candidates)} candidates sent to Groq"):
-                        for c in candidates:
-                            st.markdown(f"- {c}")
-                except Exception as e:
-                    st.error(f"Groq error: {e}")
-        else:
-            st.warning("Please enter a product title.")
+all_tops       = [p.split(" / ")[0] for p in all_paths if p]
+top_level_cats = list(set(all_tops))
+depth_max      = max((len(p.split(" / ")) for p in all_paths), default=1)
 
-# ── Batch ──────────────────────────────────────────────────────────────────────
-with tab_batch:
-    st.markdown("### Batch predict")
-    top_n_batch = st.slider("Top N per product", 1, 5, 1, key="batch_topn")
-    input_mode  = st.radio("Input method",
-                           ["📂 Upload file (CSV or Excel)", "📋 Paste a list"],
-                           horizontal=True)
+# ─────────────────────────────────────────────
+# STATS BAR
+# ─────────────────────────────────────────────
 
-    texts  = []
-    brands = []
+st.markdown(f"""
+<div class="stat-row">
+  <div class="stat-card"><div class="stat-val">{len(leaves):,}</div><div class="stat-lbl">Leaf Categories</div></div>
+  <div class="stat-card"><div class="stat-val">{len(top_level_cats):,}</div><div class="stat-lbl">Top-Level Groups</div></div>
+  <div class="stat-card"><div class="stat-val">{depth_max}</div><div class="stat-lbl">Max Depth</div></div>
+  <div class="stat-card"><div class="stat-val">{len(cache_data):,}</div><div class="stat-lbl">Cached Predictions</div></div>
+</div>
+""", unsafe_allow_html=True)
 
-    if input_mode == "📂 Upload file (CSV or Excel)":
-        uploaded = st.file_uploader("Upload CSV or Excel", type=["csv","xlsx","xls"])
-        if uploaded:
-            try:
-                if uploaded.name.endswith((".xlsx", ".xls")):
-                    df_input = pd.read_excel(uploaded)
-                else:
-                    try:
-                        df_input = pd.read_csv(uploaded, encoding="utf-8")
-                    except UnicodeDecodeError:
-                        uploaded.seek(0)
-                        df_input = pd.read_csv(uploaded, encoding="latin-1")
+# ─────────────────────────────────────────────
+# CACHE HELPERS  (normalized keys throughout)
+# ─────────────────────────────────────────────
 
-                st.dataframe(df_input.head(5), use_container_width=True)
-                col_tc, col_bc = st.columns([2, 1])
-                with col_tc:
-                    text_col = st.selectbox("Product title column", df_input.columns.tolist())
-                with col_bc:
-                    brand_col = st.selectbox("Brand column *(optional)*",
-                                            ["— none —"] + df_input.columns.tolist())
-                texts  = df_input[text_col].astype(str).fillna("").tolist()
-                brands = (df_input[brand_col].astype(str).fillna("").tolist()
-                          if brand_col != "— none —" else [""] * len(texts))
-                st.caption(f"{len(texts):,} products — all will run in parallel.")
-            except Exception as e:
-                st.error(f"Could not read file: {e}")
-        else:
-            st.markdown("Supports `.csv`, `.xlsx`, `.xls`")
+def normalize(q: str) -> str:
+    """Lowercase, strip, collapse whitespace, remove punctuation noise."""
+    q = q.lower().strip()
+    q = re.sub(r"\s+", " ", q)
+    q = re.sub(r"[^\w\s/]", "", q)
+    return q
 
-    else:
-        pasted = st.text_area("Paste one product per line:", height=180,
-                              placeholder="Nike Air Max 270\nKitchenAid Stand Mixer")
-        brand_prefix = st.text_input("Brand *(optional — applies to all)*",
-                                     placeholder="e.g. Nike", key="paste_brand")
-        if pasted.strip():
-            texts  = [t.strip() for t in pasted.strip().splitlines() if t.strip()]
-            brands = [brand_prefix.strip() if brand_prefix else ""] * len(texts)
-            st.caption(f"{len(texts):,} products — all will run in parallel.")
+def load_cache() -> dict:
+    if os.path.exists(CACHE_FILE):
+        try:
+            return json.load(open(CACHE_FILE))
+        except Exception:
+            pass
+    return {}
 
-    if texts:
-        est_secs = max(2, len(texts) // concurrency + 2)
-        st.info(f"⚡ **{len(texts)} products** will run {concurrency} at a time — estimated **~{est_secs}s** total.")
+def save_cache(c: dict):
+    json.dump(c, open(CACHE_FILE, "w"), indent=2)
 
-        if st.button("🚀 Run Batch Prediction", type="primary"):
-            import time
+def find_cache(q: str, cache: dict):
+    return cache.get(normalize(q))
 
-            # Step 1: TF-IDF shortlist for all queries in one shot
-            queries = [
-                f"{b.strip()} {t.strip()}".strip() if b.strip() else t.strip()
-                for t, b in zip(texts, brands)
-            ]
+def store_cache(q: str, result: dict, cache: dict):
+    cache[normalize(q)] = result
 
-            with st.spinner(f"Step 1: Shortlisting {len(queries)} products (TF-IDF)…"):
-                t0 = time.time()
-                all_candidates = batch_shortlist(queries, leaves, vectorizer, matrix, shortlist_k)
-                tfidf_ms = int((time.time() - t0) * 1000)
+# ─────────────────────────────────────────────
+# LOCAL CLASSIFIER
+# Trains on cache entries; retrained on demand
+# ─────────────────────────────────────────────
 
-            # Step 2: parallel Groq calls
-            prog    = st.progress(0, text="Step 2: Sending all Groq calls in parallel…")
-            t1      = time.time()
+def _train_classifier(cache: dict):
+    rows = []
+    for raw_q, val in cache.items():
+        cat = val.get("category", "") if isinstance(val, dict) else str(val)
+        if cat:
+            rows.append((raw_q, cat))
 
-            all_preds = run_parallel(queries, all_candidates, api_key,
-                                     model_choice, top_n_batch, concurrency)
+    if len(rows) < CLASSIFIER_MIN_SAMPLES:
+        return None
 
-            elapsed = time.time() - t1
-            prog.progress(1.0, text=f"✅ Done in {elapsed:.1f}s ({tfidf_ms}ms TF-IDF + {elapsed:.1f}s Groq)")
+    texts  = [r[0] for r in rows]
+    labels = [r[1] for r in rows]
 
-            # Build results table
-            rows = []
-            for text, b, preds in zip(texts, brands, all_preds):
-                rows.append({
-                    "input_text":   text,
-                    "brand":        b,
-                    "top_category": preds[0]["category"] if preds else "",
-                    "top_score":    round(preds[0]["score"], 4) if preds else 0,
-                    "top_3":        " | ".join(
-                        f"{p['category']} ({p['score']:.1%})" for p in preds[:3]
-                    ),
-                })
+    from collections import Counter
+    counts = Counter(labels)
+    filtered = [(t, l) for t, l in zip(texts, labels) if counts[l] >= 2]
+    if len(filtered) < CLASSIFIER_MIN_SAMPLES:
+        return None
 
-            df_out = pd.DataFrame(rows)
-            st.dataframe(df_out, use_container_width=True)
-            st.download_button("⬇️ Download Results CSV",
-                               df_out.to_csv(index=False).encode(),
-                               "predictions.csv", "text/csv")
+    texts, labels = zip(*filtered)
+    le  = LabelEncoder()
+    y   = le.fit_transform(labels)
+    cv  = TfidfVectorizer(ngram_range=(1, 2), max_features=30_000)
+    X   = cv.fit_transform(texts)
+    clf = LogisticRegression(max_iter=1000, C=5.0, solver="lbfgs", multi_class="multinomial")
+    clf.fit(X, y)
+    return (clf, le, cv)
 
-    else:
-        if st.button("▶️ Try sample data"):
-            sample = ["Sony WH-1000XM5 Wireless Headphones",
-                      "Instant Pot Duo 7-in-1 Pressure Cooker",
-                      "Baggy Unit Denim Jeans Men",
-                      "Harry Potter Hardcover Book",
-                      "Apple AirPods Pro",
-                      "Nike Air Max 270 Running Shoes"]
-            s_brands = ["Sony", "Instant Pot", "", "", "Apple", "Nike"]
+@st.cache_resource
+def load_classifier(cache_size: int):
+    if os.path.exists(CLASSIFIER_FILE):
+        try:
+            with open(CLASSIFIER_FILE, "rb") as fh:
+                saved_size, model = pickle.load(fh)
+            if saved_size >= CLASSIFIER_MIN_SAMPLES and model is not None:
+                return model
+        except Exception:
+            pass
 
-            queries_s = [f"{b} {t}".strip() for t, b in zip(sample, s_brands)]
-            with st.spinner("Shortlisting…"):
-                all_cands = batch_shortlist(queries_s, leaves, vectorizer, matrix, shortlist_k)
+    cache = load_cache()
+    result = _train_classifier(cache)
 
-            with st.spinner(f"Running {len(sample)} Groq calls in parallel…"):
-                import time
-                t0 = time.time()
-                all_preds = run_parallel(queries_s, all_cands, api_key, model_choice, 1, concurrency)
-                elapsed = time.time() - t0
+    if result is not None:
+        try:
+            with open(CLASSIFIER_FILE, "wb") as fh:
+                pickle.dump((len(cache), result), fh)
+        except Exception:
+            pass
 
-            st.success(f"✅ {len(sample)} products in {elapsed:.1f}s")
-            rows = [{"title": t, "brand": b,
-                     "predicted": p[0]["category"] if p else "",
-                     "score": f"{p[0]['score']:.1%}" if p else ""}
-                    for t, b, p in zip(sample, s_brands, all_preds)]
-            st.dataframe(pd.DataFrame(rows), use_container_width=True)
+    return result
 
-# ── Explore ────────────────────────────────────────────────────────────────────
-with tab_explore:
-    st.markdown("### 🗂️ Explore Category Map")
-    tops = sorted(set(p.split(" / ")[0] for p in all_paths))
-    c1, c2, c3 = st.columns(3)
-    c1.metric("Total Paths", f"{len(all_paths):,}")
-    c2.metric("Leaf Categories", f"{len(leaves):,}")
-    c3.metric("Top-level Groups", len(tops))
+def classify(q: str, clf_bundle) -> tuple[str | None, float]:
+    if clf_bundle is None:
+        return None, 0.0
+    clf, le, cv = clf_bundle
+    X    = cv.transform([normalize(q)])
+    probs = clf.predict_proba(X)[0]
+    idx  = np.argmax(probs)
+    return le.inverse_transform([idx])[0], float(probs[idx])
 
-    st.markdown("---")
-    search = st.text_input("🔎 Search", placeholder="e.g. Jeans, Headphones…")
-    if search:
-        results = [p for p in all_paths if search.lower() in p.lower()]
-        st.markdown(f"**{len(results):,} matches:**")
-        for p in results[:100]:
-            depth = len(p.split(" / ")) - 1
-            st.markdown(f"{'  '*depth}{'└─ ' if depth else ''}`{p}`")
-        if len(results) > 100:
-            st.caption(f"…and {len(results)-100} more.")
-    else:
-        st.markdown("**Top-level categories:**")
-        cols = st.columns(3)
-        for i, top in enumerate(tops):
-            count = sum(1 for p in leaves if p.startswith(top))
-            cols[i % 3].markdown(f"- **{top}** ({count:,} leaves)") remove emojis make it proffesional also im uploading category_map1 the category file to script folder so no uploading every time 
+clf_bundle = load_classifier(len(cache_data))
+clf_status = "ready" if clf_bundle is not None else f"needs {CLASSIFIER_MIN_SAMPLES}+ samples"
+
+# ─────────────────────────────────────────────
+# PREDICTION HELPERS
+# ─────────────────────────────────────────────
+
+SYSTEM_PROMPT = (
+    "You are a product categorisation assistant. "
+    "Given numbered product titles and candidate category paths for each, "
+    "return ONLY a JSON object mapping each number (as a string key) to the best "
+    "matching category path. Example: {\"1\": \"Electronics / Audio\", \"2\": \"Clothing / Shoes\"}"
+)
+
+def tfidf_top(q: str) -> tuple[str, float, list[str], list[float]]:
+    sims  = cosine_similarity(vectorizer.transform([q]), matrix)[0]
+    idxs  = np.argsort(sims)[::-1][:shortlist_k]
+    cands = [leaves[i] for i in idxs]
+    scores = [float(sims[i]) for i in idxs]
+    return cands[0], scores[0], cands, scores
+
+def batch_shortlist(queries: list[str]) -> list[list[str]]:
+    qmat = vectorizer.transform(queries)
+    sims = cosine_similarity(qmat, matrix)
+    results = []
+    for row in sims:
+        top_idx = np.argsort(row)[::-1][:shortlist_k]
+        results.append([leaves[i] for i in top_idx if row[i] > 0])
+    return results
+
+def render_path(cat_str: str) -> str:
+    if not cat_str:
+        return cat_str
+    parts = cat_str.split(" / ")
+    html  = []
+    for i, p in enumerate(parts):
+        color = "#f55036" if i == len(parts) - 1 else "#555"
+        html.append(f'<span style="color:{color}">{p}</span>')
+    return '<span style="color:#2a2a2a"> / </span>'.join(html)
+
+# ─────────────────────────────────────────────
+# HYBRID PREDICT  (single query)
+# ─────────────────────────────────────────────
+
+def hybrid_predict_single(q: str, cache: dict, client: Groq) -> dict:
+    cached = find_cache(q, cache)
+    if cached:
+        cat = cached.get("category", str(cached)) if isinstance(cached, dict) else str(cached)
+        return {"category": cat, "source": "cache", "confidence": 1.0,
+                "candidates": [], "scores": []}
+
+    best_tfidf, tfidf_score, cands, scores = tfidf_top(q)
+
+    clf_cat, clf_conf = classify(q, clf_bundle)
+    if clf_cat and clf_conf >= clf_thresh:
+        result = {"category": clf_cat, "source": "classifier",
+                  "confidence": clf_conf, "candidates": cands, "scores": scores}
+        store_cache(q, result, cache)
+        return result
+
+    if tfidf_score >= tfidf_thresh:
+        result = {"category": best_tfidf, "source": "tfidf",
+                  "confidence": tfidf_score, "candidates": cands, "scores": scores}
+        store_cache(q, result, cache)
+        return result
+
+    resp = client.chat.completions.create(
+        model=model_choice,
+        response_format={"type": "json_object"},
+        messages=[
+            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "user", "content":
+                f'Product: {q}\n\nCandidates:\n' + "\n".join(cands)},
+        ],
+    )
+    raw = resp.choices[0].message.content
+    try:
+        out = json.loads(raw)
+        cat = out.get("1") or out.get("category") or next(iter(out.values()), best_tfidf)
+    except Exception:
+        cat = best_tfidf
+
+    result = {"category": cat, "source": "ai", "confidence": None,
+              "candidates": cands, "scores": scores}
+    store_cache(q, result, cache)
+    return result
+
+# ─────────────────────────────────────────────
+# BATCHED GROQ CALL (Async)
+# ─────────────────────────────────────────────
+
+@retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=2, max=10))
+async def async_rerank(idx: int, query: str, candidates: list[str], client: AsyncGroq, model: str, top_n: int, semaphore: asyncio.Semaphore) -> tuple[int, list[dict]]:
+    async with semaphore:
+        cand_list = "\n".join(f"- {c}" for c in candidates)
+        resp = await client.chat.completions.create(
+            model=model,
+            temperature=0.1,
+            response_format={"type": "json_object"},
+            messages=[
+                {"role": "system", "content": SYSTEM_PROMPT},
+                {"role": "user", "content": f"Product: {query}\n\nCandidates:\n{cand_list}"},
+            ],
+        )
+        raw  = resp.choices[0].message.content.strip()
+        try:
+            out = json.loads(raw)
+            cat = out.get("1") or out.get("category") or next(iter(out.values()), "")
+            data = [{"category": cat, "score": 1.0}]
+        except:
+            data = []
+        return idx, data
+
+# ─────────────────────────────────────────────
+# PLOTLY BASE
+# ─────────────────────────────────────────────
+
+PLOTLY_BASE = dict(
+    paper_bgcolor="rgba(0,0,0,0)",
+    plot_bgcolor ="rgba(0,0,0,0)",
+    font=dict(family="DM Mono")
+)
+
+# ─────────────────────────────────────────────
+# TABS
+# ─────────────────────────────────────────────
+
+tab1, tab2, tab3, tab4 = st.tabs(["  Single  ", "  Batch  ", "  Explore  ", "  Intelligence  "])
+
+# ══════════════════════════════════════════════
+# TAB 1 — SINGLE
+# ══════════════════════════════════════════════
+
+with tab1:
+    col_q, col_btn = st.columns([5, 1])
+    with col_q:
+        query = st.text_input("title", placeholder="e.g. Sony WH-1000XM5 Wireless Headphones",
+                              label_visibility="collapsed")
+    with col_btn:
+        predict_btn = st.button("→ Predict", use_container_width=True, type="primary")
+
+    if predict_btn and query.strip():
+        cache = load_cache()
+        step_html = ""
+
+        cached = find_cache(query, cache)
+        if cached:
+            cat = cached.get("category", str(cached)) if isinstance(cached, dict) else str(cached)
+            source = "cache"
+            conf   = 1.0
+            cands, scores = [], []
+            step_html = '<span class="flow-step flow-hit">⚡ Cache HIT</span>'
+        else:
+            _, tfidf_score, cands, scores = tfidf_top(query)
+            clf_cat, clf_conf = classify(query, clf_bundle)
+
+            if clf_cat and clf_conf >= clf_thresh:
+                cat    = clf_cat
+                source = "classifier"
+                conf   = clf_conf
+                step_html = (
+                    '<span class="flow-step flow-skip">⚡ Cache miss</span>'
+                    '<span class="flow-arrow">→</span>'
+                    '<span class="flow-step flow-hit">🧠 Classifier HIT</span>'
+                )
+            elif tfidf_score >= tfidf_thresh:
+                cat    = cands[0]
+                source = "tfidf"
+                conf   = tfidf_score
+                step_html = (
+                    '<span class="flow-step flow-skip">⚡ Cache miss</span>'
+                    '<span class="flow-arrow">→</span>'
+                    '<span class="flow-step flow-skip">🧠 Classifier miss</span>'
+                    '<span class="flow-arrow">→</span>'
+                    '<span class="flow-step flow-hit">📐 TF-IDF HIT</span>'
+                )
+            elif not api_key:
+                st.error("No API key — all local methods below confidence threshold.")
+                st.stop()
+            else:
+                step_html = (
+                    '<span class="flow-step flow-skip">⚡ Cache miss</span>'
+                    '<span class="flow-arrow">→</span>'
+                    '<span class="flow-step flow-skip">🧠 Classifier miss</span>'
+                    '<span class="flow-arrow">→</span>'
+                    '<span class="flow-step flow-skip">📐 TF-IDF miss</span>'
+                    '<span class="flow-arrow">→</span>'
+                    '<span class="flow-step flow-hit">🤖 Groq AI</span>'
+                )
+                with st.spinner("Asking AI…"):
+                    try:
+                        client = Groq(api_key=api_key)
+                        result = hybrid_predict_single(query, cache, client)
+                        cat    = result["category"]
+                        source = result["source"]
+                        conf   = result.get("confidence")
+                        save_cache(cache)
+                    except Exception as e:
+                        st.error(f"Groq API error: {e}")
+                        st.stop()
+
+            store_cache(query, {"category": cat, "source": source,
+                                "confidence": conf if conf else None}, cache)
+            save_cache(cache)
+
+        st.markdown(f'<div style="margin:.75rem 0;display:flex;align-items:center;gap:6px;flex-wrap:wrap;">{step_html}</div>',
+                    unsafe_allow_html=True)
+
+        badge_map = {
+            "cache":      ("badge-cache",      "⚡ CACHE"),
+            "classifier": ("badge-classifier", "🧠 CLASSIFIER"),
+            "tfidf":      ("badge-tfidf",      "📐 TF-IDF"),
+            "ai":         ("badge-ai",         "🤖 AI"),
+        }
+        badge_cls, badge_txt = badge_map.get(source, ("badge-ai", "🤖 AI"))
+        conf_str = f"{conf:.0%}" if isinstance(conf, float) else "—"
+
+        st.markdown(f'<span class="badge {badge_cls}">{badge_txt}</span>', unsafe_allow_html=True)
+        st.markdown(
+            f'<div class="result-card">'
+            f'  <div class="result-lbl">Best Match</div>'
+            f'  <div class="result-cat">{render_path(cat)}</div>'
+            f'  <div class="result-meta">confidence: {conf_str} · source: {source}</div>'
+            f'</div>',
+            unsafe_allow_html=True,
+        )
+
+        if cands:
+            st.markdown('<p class="sec-lbl" style="margin-top:1.5rem;">TF-IDF Candidate Shortlist</p>', unsafe_allow_html=True)
+            n = min(15, len(cands))
+            labels = [c.split(" / ")[-1] + ("  [" + c.split(" / ")[0] + "]" if " / " in c else "") for c in cands[:n]]
+            fig = go.Figure(go.Bar(
+                x=scores[:n], y=labels, orientation="h",
+                marker=dict(color=scores[:n], colorscale=[[0,"#130803"],[0.5,"#6a1f0e"],[1,"#f55036"]], showscale=False),
+                text=[f"{s:.3f}" for s in scores[:n]], textposition="outside",
+                textfont=dict(color="#444", size=10, family="DM Mono"),
+            ))
+            fig.update_layout(
+                **PLOTLY_BASE, height=400,
+                margin=dict(l=0, r=60, t=5, b=5),
+                xaxis=dict(showgrid=True, gridcolor="#111", tickfont=dict(color="#333", size=9, family="DM Mono"), zeroline=False),
+                yaxis=dict(tickfont=dict(color="#777", size=10, family="DM Mono"), autorange="reversed"),
+            )
+            st.plotly_chart(fig, use_container_width=True)
+
+    elif predict_btn:
+        st.warning("Enter a product title first.")
+
+# ══════════════════════════════════════════════
+# TAB 2 — BATCH
+# ══════════════════════════════════════════════
+
+with tab2:
+    input_mode = st.radio("Input source", ["Upload file", "Paste list"], horizontal=True, label_visibility="collapsed")
+
+    titles_to_run = None
+    if input_mode == "Upload file":
+        col_up, col_info = st.columns([3, 2])
+        with col_up:
+            uploaded = st.file_uploader("CSV / XLSX — column A = product titles", type=["csv", "xlsx"], key="batch_file")
+        with col_info:
+            st.markdown("""
+            <div style="margin-top:1.5rem;padding:1rem;background:#0a0a0a;border:1px solid #151515;border-radius:8px;">
+              <p style="font-size:.62rem;text-transform:uppercase;letter-spacing:.1em;color:#333;margin-bottom:6px;">Format</p>
+              <p style="font-size:.8rem;color:#666;">Column A: product titles<br>Other columns ignored<br>CSV or XLSX accepted</p>
+            </div>""", unsafe_allow_html=True)
+        if uploaded:
+            df_batch = pd.read_excel(uploaded) if uploaded.name.endswith(".xlsx") else pd.read_csv(uploaded)
+            titles_to_run = df_batch.iloc[:, 0].astype(str).tolist()
+            st.caption(f"{len(titles_to_run):,} products loaded")
+    else:
+        pasted = st.text_area("Paste product titles — one per line", height=200, placeholder="Sony WH-1000XM5\nApple AirPods Pro\n…")
+        if pasted.strip():
+            titles_to_run = [l.strip() for l in pasted.splitlines() if l.strip()]
+            st.caption(f"{len(titles_to_run):,} titles detected")
+
+    if titles_to_run:
+        if st.button("▶ Run Batch", type="primary", key="run_batch"):
+            cache = load_cache()
+            results = []
+            need_ai = []
+            
+            # Phase 1: Local parsing
+            for i, q in enumerate(titles_to_run):
+                cached = find_cache(q, cache)
+                if cached:
+                    cat = cached.get("category", str(cached)) if isinstance(cached, dict) else str(cached)
+                    results.append({"#": i+1, "Product": q, "Category": cat, "Source": "⚡ Cache", "Confidence": "—"})
+                    continue
+
+                _, tfidf_score, cands, _ = tfidf_top(q)
+                clf_cat, clf_conf = classify(q, clf_bundle)
+
+                if clf_cat and clf_conf >= clf_thresh:
+                    results.append({"#": i+1, "Product": q, "Category": clf_cat, "Source": "🧠 Classifier", "Confidence": f"{clf_conf:.0%}"})
+                    store_cache(q, {"category": clf_cat, "source": "classifier", "confidence": clf_conf}, cache)
+                    continue
+
+                if tfidf_score >= tfidf_thresh:
+                    results.append({"#": i+1, "Product": q, "Category": cands[0], "Source": "📐 TF-IDF", "Confidence": f"{tfidf_score:.0%}"})
+                    store_cache(q, {"category": cands[0], "source": "tfidf", "confidence": tfidf_score}, cache)
+                    continue
+
+                results.append({"#": i+1, "Product": q, "Category": "—", "Source": "⏳ Pending", "Confidence": "—"})
+                need_ai.append((i, q, cands))
+
+            # Setup display
+            progress = st.progress(0, text="Processing...")
+            table = st.empty()
+            table.dataframe(pd.DataFrame(results), use_container_width=True, hide_index=True)
+
+            # Phase 2: AI Processing safely inside a single asyncio.run
+            if need_ai and api_key:
+                async def process_all_ai():
+                    client = AsyncGroq(api_key=api_key)
+                    sem = asyncio.Semaphore(concurrency)
+                    
+                    done = 0
+                    # chunking loop handled entirely within async scope
+                    for i in range(0, len(need_ai), concurrency):
+                        chunk = need_ai[i:i+concurrency]
+                        tasks = [async_rerank(idx, q, c, client, model_choice, 1, sem) for idx, q, c in chunk]
+                        
+                        chunk_results = await asyncio.gather(*tasks, return_exceptions=True)
+                        
+                        for (orig_idx, q, cands), preds in zip(chunk, chunk_results):
+                            done += 1
+                            if isinstance(preds, Exception):
+                                results[orig_idx]["Category"] = f"Error: {preds}"
+                                results[orig_idx]["Source"] = "❌ Failed"
+                            else:
+                                actual_preds = preds[1]
+                                cat = actual_preds[0]["category"] if actual_preds else (cands[0] if cands else "")
+                                results[orig_idx]["Category"] = cat
+                                results[orig_idx]["Source"] = "🤖 AI"
+                                store_cache(q, {"category": cat, "source": "ai"}, cache)
+                        
+                        perc = min(100, int(done / len(need_ai) * 100))
+                        progress.progress(perc, text=f"AI Processing: {done}/{len(need_ai)}")
+                        table.dataframe(pd.DataFrame(results), use_container_width=True, hide_index=True)
+                
+                # Run the whole block in one active event loop, preventing the 'anyio' RetryError
+                asyncio.run(process_all_ai())
+
+            save_cache(cache)
+            progress.empty()
+            
+            res_df = pd.DataFrame(results)
+            st.success("Batch Complete!")
+            st.download_button("↓ Download Results CSV", res_df.to_csv(index=False).encode(), "predictions.csv", "text/csv", use_container_width=True)
+
+# ══════════════════════════════════════════════
+# TAB 3 — EXPLORE
+# ══════════════════════════════════════════════
+
+with tab3:
+    st.markdown('<p class="sec-lbl">Search & Explore the Category Tree</p>', unsafe_allow_html=True)
+
+    col_s, col_d = st.columns([4, 1])
+    with col_s:
+        search_q  = st.text_input("search", placeholder="Filter by keyword…",
+                                  label_visibility="collapsed", key="ex_search")
+    with col_d:
+        depth_opt = st.selectbox("Depth", ["All"] + list(range(1, depth_max + 1)),
+                                 label_visibility="collapsed", key="ex_depth")
+
+    filtered = leaves
+    if search_q.strip():
+        filtered = [l for l in filtered if search_q.lower() in l.lower()]
+    if depth_opt != "All":
+        filtered = [l for l in filtered if len(l.split(" / ")) == int(depth_opt)]
+
+    st.caption(f"{len(filtered):,} of {len(leaves):,} categories shown")
+
+    col_a, col_b = st.columns(2)
+
+    with col_a:
+        st.markdown('<p class="sec-lbl">Categories per Top-Level Group</p>', unsafe_allow_html=True)
+        tc = pd.Series([l.split(" / ")[0] for l in filtered]).value_counts().head(20)
+        fig_top = go.Figure(go.Bar(
+            x=tc.values.tolist(), y=tc.index.tolist(), orientation="h",
+            marker=dict(color=tc.values.tolist(),
+                        colorscale=[[0,"#0d0503"],[0.4,"#5a1808"],[1,"#f55036"]], showscale=False),
+            text=tc.values.tolist(), textposition="outside",
+            textfont=dict(color="#333", size=9, family="DM Mono"),
+        ))
+        fig_top.update_layout(**PLOTLY_BASE, height=400,
+                              margin=dict(l=0, r=40, t=5, b=5),
+                              xaxis=dict(tickfont=dict(color="#333", size=9, family="DM Mono"), gridcolor="#0f0f0f"),
+                              yaxis=dict(tickfont=dict(color="#777", size=10, family="DM Mono"), autorange="reversed"))
+        st.plotly_chart(fig_top, use_container_width=True)
+
+    with col_b:
+        st.markdown('<p class="sec-lbl">Depth Distribution</p>', unsafe_allow_html=True)
+        depths = pd.Series([len(l.split(" / ")) for l in filtered]).value_counts().sort_index()
+        fig_dep = go.Figure(go.Bar(
+            x=[f"Level {i}" for i in depths.index], y=depths.values.tolist(),
+            marker=dict(color=depths.values.tolist(),
+                        colorscale=[[0,"#0d0503"],[1,"#f55036"]], showscale=False),
+            text=depths.values.tolist(), textposition="outside",
+            textfont=dict(color="#333", size=10, family="DM Mono"),
+        ))
+        fig_dep.update_layout(**PLOTLY_BASE, height=400,
+                              margin=dict(l=10, r=10, t=5, b=10),
+                              xaxis=dict(tickfont=dict(color="#777", size=10, family="DM Mono"), gridcolor="#0f0f0f"),
+                              yaxis=dict(tickfont=dict(color="#333", size=9, family="DM Mono"), gridcolor="#0f0f0f"))
+        st.plotly_chart(fig_dep, use_container_width=True)
+
+    st.divider()
+    st.markdown('<p class="sec-lbl">Treemap — Click to Drill Down</p>', unsafe_allow_html=True)
+
+    td = defaultdict(int)
+    for leaf in filtered:
+        parts  = leaf.split(" / ")
+        top    = parts[0]
+        second = parts[1] if len(parts) >= 2 else top
+        td[(top, second)] += 1
+
+    top_totals = defaultdict(int)
+    for (top, second), cnt in td.items():
+        top_totals[top] += cnt
+
+    tm_ids, tm_labels, tm_parents, tm_values = ["root"], ["All"], [""], [0]
+    for top, total in sorted(top_totals.items(), key=lambda x: -x[1])[:35]:
+        tm_ids.append(top); tm_labels.append(top); tm_parents.append("root"); tm_values.append(total)
+
+    seen = set(tm_ids)
+    for (top, second), cnt in sorted(td.items(), key=lambda x: -x[1]):
+        nid = f"{top}||{second}"
+        if top in seen and nid not in seen and second != top:
+            tm_ids.append(nid); tm_labels.append(second)
+            tm_parents.append(top); tm_values.append(cnt)
+            seen.add(nid)
+
+    fig_tree = go.Figure(go.Treemap(
+        ids=tm_ids, labels=tm_labels, parents=tm_parents, values=tm_values,
+        branchvalues="total",
+        marker=dict(colorscale=[[0,"#0a0302"],[0.25,"#2a0d08"],[0.6,"#8a2a14"],[1,"#f55036"]],
+                    showscale=False, line=dict(width=1, color="#050505")),
+        textfont=dict(family="DM Mono", size=11, color="#ddd"),
+        hovertemplate="<b>%{label}</b><br>%{value} leaf categories<extra></extra>",
+        pathbar=dict(visible=True, textfont=dict(family="DM Mono", size=10)),
+    ))
+    fig_tree.update_layout(**PLOTLY_BASE, height=520, margin=dict(l=0, r=0, t=30, b=0))
+    st.plotly_chart(fig_tree, use_container_width=True)
+
+    st.divider()
+    max_show = max(10, len(filtered))
+    show_n   = st.slider("Rows to show", 10, min(500, max_show), min(50, max_show), key="ex_rows")
+    display_df = pd.DataFrame({
+        "Category Path": filtered[:show_n],
+        "Depth":         [len(l.split(" / ")) for l in filtered[:show_n]],
+        "Top-Level":     [l.split(" / ")[0]   for l in filtered[:show_n]],
+        "Leaf Node":     [l.split(" / ")[-1]  for l in filtered[:show_n]],
+    })
+    st.dataframe(display_df, use_container_width=True, hide_index=True)
+    if len(filtered) > show_n:
+        st.caption(f"Showing {show_n:,} of {len(filtered):,}")
+    st.download_button("↓ Download Filtered Categories",
+                       pd.DataFrame({"category_path": filtered}).to_csv(index=False).encode(),
+                       "categories_filtered.csv", "text/csv")
+
+# ══════════════════════════════════════════════
+# TAB 4 — INTELLIGENCE (classifier & cache stats)
+# ══════════════════════════════════════════════
+
+with tab4:
+    st.markdown('<p class="sec-lbl">System Intelligence Dashboard</p>', unsafe_allow_html=True)
+
+    # ── Hybrid flow diagram ──
+    st.markdown("""
+    <div style="background:#0a0a0a;border:1px solid #1a1a1a;border-radius:8px;padding:1.5rem;margin-bottom:1.5rem;">
+      <p style="font-size:.62rem;text-transform:uppercase;letter-spacing:.1em;color:#333;margin-bottom:1rem;">Prediction Flow</p>
+      <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap;">
+        <div style="text-align:center">
+          <div style="background:#0a1a0a;border:1px solid #1a3a1a;color:#4caf72;padding:8px 14px;border-radius:6px;font-size:.75rem;">⚡ Cache</div>
+          <div style="font-size:.6rem;color:#333;margin-top:4px;">instant</div>
+        </div>
+        <span style="color:#2a2a2a;font-size:1.2rem;">→</span>
+        <div style="text-align:center">
+          <div style="background:#0a0f1a;border:1px solid #1a2a3a;color:#4a9ef5;padding:8px 14px;border-radius:6px;font-size:.75rem;">🧠 Classifier</div>
+          <div style="font-size:.6rem;color:#333;margin-top:4px;">local ML</div>
+        </div>
+        <span style="color:#2a2a2a;font-size:1.2rem;">→</span>
+        <div style="text-align:center">
+          <div style="background:#1a1a0a;border:1px solid #3a3a1a;color:#d4c44a;padding:8px 14px;border-radius:6px;font-size:.75rem;">📐 TF-IDF Gate</div>
+          <div style="font-size:.6rem;color:#333;margin-top:4px;">similarity</div>
+        </div>
+        <span style="color:#2a2a2a;font-size:1.2rem;">→</span>
+        <div style="text-align:center">
+          <div style="background:#1a0d08;border:1px solid #3a1a0a;color:#f55036;padding:8px 14px;border-radius:6px;font-size:.75rem;">🤖 Groq AI</div>
+          <div style="font-size:.6rem;color:#333;margin-top:4px;">last resort</div>
+        </div>
+      </div>
+    </div>
+    """, unsafe_allow_html=True)
+
+    # ── Classifier status ──
+    col_cl, col_ca = st.columns(2)
+
+    with col_cl:
+        st.markdown('<p class="sec-lbl">Local Classifier</p>', unsafe_allow_html=True)
+        if clf_bundle is not None:
+            clf, le, cv = clf_bundle
+            n_classes = len(le.classes_)
+            n_samples = len(cache_data)
+            st.markdown(f"""
+            <div style="background:#0a0f1a;border:1px solid #1a2a3a;border-radius:8px;padding:1rem;">
+              <div style="display:flex;gap:1.5rem;flex-wrap:wrap;">
+                <div><div class="stat-val" style="font-size:1.2rem;">{n_classes:,}</div><div class="stat-lbl">Classes</div></div>
+                <div><div class="stat-val" style="font-size:1.2rem;">{n_samples:,}</div><div class="stat-lbl">Training Samples</div></div>
+                <div><div class="stat-val" style="font-size:1.2rem;">{clf_thresh:.0%}</div><div class="stat-lbl">Confidence Gate</div></div>
+              </div>
+              <p style="color:#4a9ef5;font-size:.7rem;margin-top:.75rem;">✓ Classifier active</p>
+            </div>
+            """, unsafe_allow_html=True)
+        else:
+            needed = CLASSIFIER_MIN_SAMPLES - len(cache_data)
+            st.markdown(f"""
+            <div style="background:#0d0d0d;border:1px solid #1e1e1e;border-radius:8px;padding:1rem;">
+              <p style="color:#555;font-size:.8rem;">Classifier not yet trained.</p>
+              <p style="color:#f55036;font-size:.75rem;">Need {needed} more cached predictions to activate.</p>
+              <div style="background:#111;border-radius:4px;height:6px;margin-top:.5rem;">
+                <div style="background:#f55036;height:6px;border-radius:4px;width:{min(100, len(cache_data)/CLASSIFIER_MIN_SAMPLES*100):.0f}%"></div>
+              </div>
+              <p style="color:#333;font-size:.62rem;margin-top:4px;">{len(cache_data)} / {CLASSIFIER_MIN_SAMPLES}</p>
+            </div>
+            """, unsafe_allow_html=True)
+
+    with col_ca:
+        st.markdown('<p class="sec-lbl">Cache Analytics</p>', unsafe_allow_html=True)
+        if cache_data:
+            sources = []
+            for v in cache_data.values():
+                s = v.get("source", "unknown") if isinstance(v, dict) else "legacy"
+                sources.append(s)
+            src_s = pd.Series(sources).value_counts()
+            colors_map = {"cache":"#4caf72","classifier":"#4a9ef5","tfidf":"#d4c44a","ai":"#f55036","legacy":"#555","unknown":"#333"}
+            colors = [colors_map.get(s, "#555") for s in src_s.index]
+
+            fig_src = go.Figure(go.Pie(
+                labels=src_s.index.tolist(), values=src_s.values.tolist(),
+                hole=0.55,
+                marker=dict(colors=colors, line=dict(color="#050505", width=2)),
+                textfont=dict(family="DM Mono", size=10),
+            ))
+            fig_src.update_layout(
+                paper_bgcolor="rgba(0,0,0,0)", height=220,
+                margin=dict(l=0, r=0, t=10, b=0),
+                font=dict(family="DM Mono"),
+                legend=dict(font=dict(color="#666", size=9)),
+                annotations=[dict(text=f"{len(cache_data)}<br><span style='font-size:8px'>entries</span>",
+                                  x=0.5, y=0.5, showarrow=False,
+                                  font=dict(color="#f55036", size=13, family="Syne"))],
+            )
+            st.plotly_chart(fig_src, use_container_width=True)
+        else:
+            st.caption("No cache entries yet.")
+
+    # ── Top cached categories ──
+    if cache_data:
+        st.divider()
+        st.markdown('<p class="sec-lbl">Top Cached Categories</p>', unsafe_allow_html=True)
+        cats = []
+        for v in cache_data.values():
+            c = v.get("category","") if isinstance(v, dict) else str(v)
+            if c:
+                cats.append(c)
+        if cats:
+            top_cached = pd.Series(cats).value_counts().head(20)
+            fig_cc = go.Figure(go.Bar(
+                x=top_cached.values.tolist(), y=top_cached.index.tolist(), orientation="h",
+                marker=dict(color=top_cached.values.tolist(),
+                            colorscale=[[0,"#0d0503"],[1,"#f55036"]], showscale=False),
+            ))
+            fig_cc.update_layout(
+                **PLOTLY_BASE, height=max(300, len(top_cached) * 22),
+                margin=dict(l=0, r=40, t=5, b=5),
+                xaxis=dict(tickfont=dict(color="#333", size=9, family="DM Mono"), gridcolor="#0f0f0f"),
+                yaxis=dict(tickfont=dict(color="#777", size=10, family="DM Mono"), autorange="reversed"),
+            )
+            st.plotly_chart(fig_cc, use_container_width=True)
+
+    # ── Thresholds explainer ──
+    st.divider()
+    st.markdown('<p class="sec-lbl">How Thresholds Work</p>', unsafe_allow_html=True)
+    st.markdown(f"""
+    <div style="display:grid;grid-template-columns:1fr 1fr;gap:12px;">
+      <div style="background:#0a0a0a;border:1px solid #1a1a1a;border-radius:8px;padding:1rem;">
+        <p style="color:#d4c44a;font-size:.7rem;font-weight:600;margin-bottom:4px;">📐 TF-IDF Gate  ({tfidf_thresh:.0%})</p>
+        <p style="color:#555;font-size:.72rem;line-height:1.5;">
+          If the highest cosine similarity score between the query and category index
+          exceeds <b style="color:#888">{tfidf_thresh:.0%}</b>, the top match is returned
+          without calling the AI. Lower this to send more to AI; raise it to trust TF-IDF more.
+        </p>
+      </div>
+      <div style="background:#0a0a0a;border:1px solid #1a1a1a;border-radius:8px;padding:1rem;">
+        <p style="color:#4a9ef5;font-size:.7rem;font-weight:600;margin-bottom:4px;">🧠 Classifier Gate  ({clf_thresh:.0%})</p>
+        <p style="color:#555;font-size:.72rem;line-height:1.5;">
+          A LogisticRegression trained on your cache history. If it predicts a category
+          with probability &gt; <b style="color:#888">{clf_thresh:.0%}</b>, it bypasses
+          both TF-IDF and AI. Activates after {CLASSIFIER_MIN_SAMPLES} cached predictions.
+        </p>
+      </div>
+    </div>
+    """, unsafe_allow_html=True)
