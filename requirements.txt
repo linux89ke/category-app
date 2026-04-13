@@ -1,6 +1,9 @@
 streamlit
 pandas
 numpy
+plotly
 scikit-learn
-rapidfuzz
+groq
+tenacity
+sentence-transformers
 openpyxl
