@@ -163,11 +163,20 @@ async def async_ai(q, cands, client, sem):
             temperature=0.1,
             response_format={"type": "json_object"},
             messages=[
-                {"role": "system", "content": "Pick best category"},
-                {"role": "user", "content": q + "\n" + "\n".join(cands)}
+                {"role": "system", "content": (
+                    "You are a product categorisation assistant. "
+                    "Given a product title and a list of candidate categories, "
+                    "return ONLY a JSON object with a single key 'category' "
+                    "whose value is the best matching category path from the list."
+                )},
+                {"role": "user", "content": f"Product: {q}\n\nCandidates:\n" + "\n".join(cands)}
             ],
         )
-        return json.loads(resp.choices[0].message.content)
+        raw = resp.choices[0].message.content
+        try:
+            return json.loads(raw)
+        except json.JSONDecodeError:
+            return {"category": raw.strip()}
 
 # ─────────────────────────────────────────────
 # SINGLE TAB
@@ -191,19 +200,32 @@ with tab1:
             if not api_key:
                 st.error("No API key")
             else:
-                client = Groq(api_key=api_key)
-                resp = client.chat.completions.create(
-                    model=model_choice,
-                    response_format={"type": "json_object"},
-                    messages=[
-                        {"role": "system", "content": "Pick best category"},
-                        {"role": "user", "content": query + "\n" + "\n".join(cands)}
-                    ],
-                )
-                out = json.loads(resp.choices[0].message.content)
-                cache[query] = out
-                save_cache(cache)
-                st.write(out)
+                try:
+                    client = Groq(api_key=api_key)
+                    resp = client.chat.completions.create(
+                        model=model_choice,
+                        response_format={"type": "json_object"},
+                        messages=[
+                            {"role": "system", "content": (
+                                "You are a product categorisation assistant. "
+                                "Given a product title and a list of candidate categories, "
+                                "return ONLY a JSON object with a single key 'category' "
+                                "whose value is the best matching category path from the list."
+                            )},
+                            {"role": "user", "content": f"Product: {query}\n\nCandidates:\n" + "\n".join(cands)}
+                        ],
+                    )
+                    raw = resp.choices[0].message.content
+                    try:
+                        out = json.loads(raw)
+                    except json.JSONDecodeError:
+                        out = {"category": raw.strip(), "parse_warning": "Response was not valid JSON"}
+                    cache[query.lower()] = out
+                    save_cache(cache)
+                    st.write(out)
+                except Exception as e:
+                    st.error(f"Groq API error: {e}")
+                    st.info("💡 Check your API key at console.groq.com and confirm the selected model is available.")
 
 # ─────────────────────────────────────────────
 # BATCH TAB
@@ -242,19 +264,25 @@ with tab2:
                     sims = cosine_similarity(vectorizer.transform([q]), matrix)[0]
                     idxs = np.argsort(sims)[::-1][:shortlist_k]
                     cands = [leaves[x] for x in idxs]
-
                     tasks.append(async_ai(q, cands, client, sem))
+                return await asyncio.gather(*tasks, return_exceptions=True)
 
-                return await asyncio.gather(*tasks)
+            try:
+                outputs = asyncio.run(run())
 
-            outputs = asyncio.run(run())
+                for (i, q), out in zip(todo, outputs):
+                    if isinstance(out, Exception):
+                        results[i]["Category"] = f"Error: {out}"
+                        results[i]["Status"] = "Failed"
+                    else:
+                        results[i]["Category"] = out
+                        results[i]["Status"] = "Done"
+                        cache[q.lower()] = out
 
-            for (i, q), out in zip(todo, outputs):
-                results[i]["Category"] = out
-                results[i]["Status"] = "Done"
-                cache[q] = out
+                    table.dataframe(results)
 
-                table.dataframe(results)
-
-            save_cache(cache)
-            st.success("Done")
+                save_cache(cache)
+                st.success("Done")
+            except Exception as e:
+                st.error(f"Batch error: {e}")
+                st.info("💡 Check your API key at console.groq.com and confirm the selected model is available.")
