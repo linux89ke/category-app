@@ -1,8 +1,8 @@
 """
 Product Category Predictor
-Strategy : Semantic Embeddings shortlist + async parallel Groq reranking + Smart Caching
+Strategy : Semantic Embeddings shortlist + async parallel AI reranking + Smart Caching
 Speed    : all products run concurrently, ~2-5s for any batch size
-Cost     : 1 Groq call per product (0 calls if cached)
+Cost     : 1 API call per product (0 calls if cached)
 """
 
 import os
@@ -74,15 +74,12 @@ def find_in_cache(query, cache_data, similarity_threshold=0.90):
     if not query_lower:
         return None, None, 0.0
 
-    # Create a lookup dict with lowercased keys
     lower_cache = {k.lower().strip(): (k, v) for k, v in cache_data.items()}
     
-    # 1. Check for Exact match
     if query_lower in lower_cache:
         original_key, cached_val = lower_cache[query_lower]
         return cached_val, original_key, 1.0
 
-    # 2. Check for Similar match
     matches = difflib.get_close_matches(query_lower, lower_cache.keys(), n=1, cutoff=similarity_threshold)
     if matches:
         best_match_lower = matches[0]
@@ -103,7 +100,6 @@ def get_embedding_model():
 def load_or_build_index(file_path: str, cache_file="category_index.pkl"):
     model = get_embedding_model()
     
-    # Rebuild if cache doesn't exist OR if file is newer than the cache
     needs_rebuild = True
     if os.path.exists(cache_file) and os.path.exists(file_path):
         file_mtime = os.path.getmtime(file_path)
@@ -115,7 +111,6 @@ def load_or_build_index(file_path: str, cache_file="category_index.pkl"):
         with open(cache_file, "rb") as f:
             return pickle.load(f)
 
-    # Build it from the Excel/CSV file
     try:
         df = pd.read_excel(file_path)
     except Exception:
@@ -155,7 +150,7 @@ def batch_shortlist(queries: list[str], leaves, matrix, k: int = 25) -> list[lis
     return results
 
 
-# ─── Async Groq reranking ─────────────────────────────────────────────────────
+# ─── Async AI reranking ─────────────────────────────────────────────────────
 
 SYSTEM_TEMPLATE = """You are a product categorization expert.
 Given a product title and a list of candidate category paths, pick the {top_n} best matching categories.
@@ -326,44 +321,36 @@ def render_results(preds, score_threshold, show_chart, show_hierarchy):
 # ─── Sidebar ──────────────────────────────────────────────────────────────────
 
 with st.sidebar:
-    st.markdown("## Groq API Key")
+    st.markdown("## API Key")
     # Pulls from Streamlit Secrets or Environment Variables automatically
     default_key = st.secrets.get("GROQ_API_KEY", os.environ.get("GROQ_API_KEY", ""))
     
     api_key = st.text_input("Paste your key here:",
                             value=default_key,
                             type="password", placeholder="gsk_...")
-    st.caption("Free key at console.groq.com")
-
+    
     st.markdown("---")
     st.markdown("## Settings")
     model_choice = st.selectbox(
-        "Groq model",
+        "AI Model",
         ["llama-3.1-8b-instant", "llama-3.3-70b-versatile", "mixtral-8x7b-32768"],
         index=0,
     )
     top_n        = st.slider("Top N results", 1, 10, 5)
     shortlist_k  = st.slider("Shortlist size", 5, 50, 25,
-                             help="Candidates sent to Groq per product. 25 ensures edge cases are included.")
+                             help="Candidates sent to the AI per product. 25 ensures edge cases are included.")
     concurrency  = st.slider("Parallel requests", 1, 30, 10)
     score_threshold = st.slider("Min confidence", 0.0, 1.0, 0.0, 0.05)
     show_chart   = st.checkbox("Show confidence chart", value=True)
     show_hierarchy = st.checkbox("Show category hierarchy", value=True)
 
-    st.markdown("---")
-    st.markdown("""### Updates included
-- **Smart JSON Caching:** Instantly loads exact & similar products without API costs.
-- **Semantic Search:** Understands context and meaning.
-- **Few-Shot Prompting:** Trained to avoid putting single items into 'Set' categories.
-- **Auto-Retries:** Automatically retries API calls if they fail.
-""")
 
 # ─── Main ─────────────────────────────────────────────────────────────────────
 
 st.markdown('<p class="main-title">Product Category Predictor</p>', unsafe_allow_html=True)
 
 if not api_key:
-    st.info("Enter your Groq API key in the sidebar or Streamlit Secrets.")
+    st.info("Enter your API key in the sidebar or via Streamlit Secrets.")
     st.stop()
 
 # Detect file map
@@ -381,8 +368,6 @@ if not map_file and not os.path.exists(cache_path):
 
 with st.spinner("Loading semantic category index..."):
     leaves, matrix, all_paths = load_or_build_index(map_file or cache_path, cache_path)
-
-st.success(f"Successfully loaded {len(leaves):,} leaf categories.")
 
 # ─── Tabs ─────────────────────────────────────────────────────────────────────
 
@@ -420,7 +405,7 @@ with tab_single:
             else:
                 with st.spinner("Shortlisting via Semantic Search..."):
                     candidates = shortlist(query, leaves, matrix, shortlist_k)
-                with st.spinner(f"Asking Groq ({len(candidates)} candidates)..."):
+                with st.spinner(f"Analyzing {len(candidates)} candidates..."):
                     try:
                         preds = sync_rerank(query, candidates, api_key, model_choice, top_n)
                         
@@ -429,11 +414,8 @@ with tab_single:
                         save_to_cache(pred_cache)
                         
                         render_results(preds, score_threshold, show_chart, show_hierarchy)
-                        with st.expander(f"{len(candidates)} candidates sent to Groq"):
-                            for c in candidates:
-                                st.markdown(f"- {c}")
                     except Exception as e:
-                        st.error(f"Groq error: {e}")
+                        st.error(f"API error: {e}")
         else:
             st.warning("Please enter a product title.")
 
@@ -498,7 +480,7 @@ with tab_batch:
                     to_predict_indices.append(i)
                     to_predict_queries.append(q)
             
-            st.info(f"Loaded {cache_hits} products instantly from cache. Sending {len(to_predict_queries)} to Groq.")
+            st.info(f"Loaded {cache_hits} products instantly from cache. Sending {len(to_predict_queries)} to AI.")
 
             if to_predict_queries:
                 with st.spinner(f"Shortlisting {len(to_predict_queries)} products (Semantic Search)..."):
@@ -506,12 +488,12 @@ with tab_batch:
                     all_candidates = batch_shortlist(to_predict_queries, leaves, matrix, shortlist_k)
                     tfidf_ms = int((time.time() - t0) * 1000)
 
-                prog = st.progress(0, text="Sending Groq calls in parallel...")
+                prog = st.progress(0, text="Processing API calls in parallel...")
                 t1 = time.time()
 
                 new_preds = run_parallel(to_predict_queries, all_candidates, api_key, model_choice, top_n_batch, concurrency)
                 elapsed = time.time() - t1
-                prog.progress(1.0, text=f"Groq API done in {elapsed:.1f}s")
+                prog.progress(1.0, text=f"API calls completed in {elapsed:.1f}s")
                 
                 # Merge back and save to cache
                 for idx, q, preds in zip(to_predict_indices, to_predict_queries, new_preds):
