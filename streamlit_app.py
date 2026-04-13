@@ -1,8 +1,6 @@
 """
 Product Category Predictor
-Strategy : Fast TF-IDF shortlist + async parallel AI reranking + Smart Caching
-Speed    : Instant loading + 2-5s for batch processing
-Cost     : 1 API call per product (0 calls if cached)
+Stable Version — UI Safe + No Blocking + Cache Protected
 """
 
 import os
@@ -18,177 +16,66 @@ from sklearn.metrics.pairwise import cosine_similarity
 from groq import AsyncGroq, Groq
 from tenacity import retry, stop_after_attempt, wait_exponential
 
-# ─────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────
 # CONFIG
-# ─────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────
 
 CACHE_FILE = "prediction_cache.json"
 INDEX_FILE = "category_index.pkl"
-CACHE_VERSION = "v2"
+CACHE_VERSION = "v3"
 
-st.set_page_config(
-    page_title="Product Category Predictor",
-    layout="wide",
-    initial_sidebar_state="expanded"
-)
+st.set_page_config(page_title="Category Predictor", layout="wide")
 
-# ─────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────
 # STYLES
-# ─────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────
 
 st.markdown("""
 <style>
 .main-title {
-    font-size:2.4rem; font-weight:700;
-    background:linear-gradient(90deg,#f55036 0%,#ff8c00 100%);
-    -webkit-background-clip:text; -webkit-text-fill-color:transparent;
+    font-size:2.2rem;
+    font-weight:700;
+    color:#f55036;
 }
-.result-card {
-    background:#f8f9fc; border-left:4px solid #f55036;
-    padding:0.8rem; border-radius:8px;
-}
-.cache-badge {
-    background:#e6f4ea; color:#1e7e34;
-    padding:4px 10px; border-radius:12px;
-    font-size:0.8rem; font-weight:bold;
+.cache {
+    color:green;
+    font-weight:bold;
 }
 </style>
 """, unsafe_allow_html=True)
 
-# ─────────────────────────────────────────────────────────────
-# HELPERS
-# ─────────────────────────────────────────────────────────────
-
-def path_to_doc(path: str) -> str:
-    parts = path.split(" / ")
-    return " ".join(parts) + " " + " ".join(parts[-2:]) * 2
-
-# ─────────────────────────────────────────────────────────────
-# INDEX (FIXED)
-# ─────────────────────────────────────────────────────────────
-
-@st.cache_resource(show_spinner="Initializing category index...")
-def load_or_build_index(file_path: str):
-
-    # Try load cache
-    if os.path.exists(INDEX_FILE):
-        try:
-            with open(INDEX_FILE, "rb") as f:
-                version, data = pickle.load(f)
-
-            if version == CACHE_VERSION and isinstance(data, tuple) and len(data) == 4:
-                return data
-            else:
-                print("⚠️ Outdated cache — rebuilding...")
-        except Exception as e:
-            print("⚠️ Cache corrupted — rebuilding...", e)
-
-    # Build fresh
-    if file_path.endswith(".csv"):
-        df = pd.read_csv(file_path)
-    else:
-        df = pd.read_excel(file_path)
-
-    all_paths = df.iloc[:, 2].dropna().astype(str).tolist()
-    path_set = set(all_paths)
-
-    leaves = [
-        p for p in all_paths
-        if not any(other.startswith(p + " / ") for other in path_set)
-    ]
-
-    docs = [path_to_doc(p) for p in leaves]
-
-    vectorizer = TfidfVectorizer(ngram_range=(1, 2), sublinear_tf=True)
-    matrix = vectorizer.fit_transform(docs)
-
-    result = (leaves, vectorizer, matrix, all_paths)
-
-    with open(INDEX_FILE, "wb") as f:
-        pickle.dump((CACHE_VERSION, result), f)
-
-    return result
-
-# ─────────────────────────────────────────────────────────────
-# JSON CACHE
-# ─────────────────────────────────────────────────────────────
-
-def load_cache():
-    if os.path.exists(CACHE_FILE):
-        try:
-            with open(CACHE_FILE, "r") as f:
-                return json.load(f)
-        except:
-            return {}
-    return {}
-
-def save_to_cache(cache_data):
-    with open(CACHE_FILE, "w") as f:
-        json.dump(cache_data, f, indent=2)
-
-def find_in_cache(query, cache_data, threshold=0.92):
-    q = query.lower().strip()
-    lower_cache = {k.lower(): (k, v) for k, v in cache_data.items()}
-
-    if q in lower_cache:
-        k, v = lower_cache[q]
-        return v, k, 1.0
-
-    matches = difflib.get_close_matches(q, lower_cache.keys(), n=1, cutoff=threshold)
-    if matches:
-        best = matches[0]
-        k, v = lower_cache[best]
-        return v, k, 0.95
-
-    return None, None, 0
-
-# ─────────────────────────────────────────────────────────────
-# AI
-# ─────────────────────────────────────────────────────────────
-
-SYSTEM_TEMPLATE = """You are a product categorization expert.
-Return JSON:
-{"categories":[{"category":"..."}]}"""
-
-@retry(stop=stop_after_attempt(3), wait=wait_exponential())
-async def async_rerank(idx, query, candidates, client, model, top_n, sem):
-    async with sem:
-        cand_list = "\n".join(f"- {c}" for c in candidates)
-
-        resp = await client.chat.completions.create(
-            model=model,
-            temperature=0.1,
-            response_format={"type": "json_object"},
-            messages=[
-                {"role": "system", "content": SYSTEM_TEMPLATE},
-                {"role": "user", "content": f"{query}\n\n{cand_list}"}
-            ],
-        )
-
-        data = json.loads(resp.choices[0].message.content)
-        return idx, data.get("categories", [])
-
-# ─────────────────────────────────────────────────────────────
-# SIDEBAR
-# ─────────────────────────────────────────────────────────────
-
-with st.sidebar:
-    api_key = st.text_input("API Key", type="password")
-    model_choice = st.selectbox("Model", ["llama-3.1-8b-instant", "llama-3.3-70b-versatile"])
-    top_n = st.slider("Top N", 1, 10, 5)
-    shortlist_k = st.slider("Shortlist", 5, 50, 25)
-    concurrency = st.slider("Parallel", 1, 20, 10)
-
-# ─────────────────────────────────────────────────────────────
-# MAIN
-# ─────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────
+# ALWAYS SHOW UI FIRST
+# ─────────────────────────────────────────────
 
 st.markdown('<p class="main-title">Product Category Predictor</p>', unsafe_allow_html=True)
 
-if not api_key:
-    st.stop()
+tab1, tab2 = st.tabs(["Single", "Batch"])
 
-# Detect file
+# ─────────────────────────────────────────────
+# SIDEBAR (NON-BLOCKING)
+# ─────────────────────────────────────────────
+
+with st.sidebar:
+    st.header("Settings")
+
+    api_key = st.secrets.get("GROQ_API_KEY") or os.environ.get("GROQ_API_KEY")
+    manual_key = st.text_input("Override API Key", type="password")
+
+    if manual_key:
+        api_key = manual_key
+
+    if not api_key:
+        st.warning("⚠️ No API key — AI predictions disabled")
+
+    model_choice = st.selectbox("Model", ["llama-3.1-8b-instant", "llama-3.3-70b-versatile"])
+    shortlist_k = st.slider("Shortlist", 5, 50, 20)
+    concurrency = st.slider("Parallel Requests", 1, 20, 10)
+
+# ─────────────────────────────────────────────
+# FILE HANDLING (SAFE)
+# ─────────────────────────────────────────────
+
 map_file = None
 for f in ["category_map1.csv", "category_map1.xlsx"]:
     if os.path.exists(f):
@@ -196,112 +83,178 @@ for f in ["category_map1.csv", "category_map1.xlsx"]:
         break
 
 if not map_file:
-    st.error("Missing category file")
+    st.warning("⚠️ No category map found. Upload one below.")
+
+    uploaded = st.file_uploader("Upload category file", type=["csv", "xlsx"])
+
+    if uploaded:
+        df = pd.read_excel(uploaded) if uploaded.name.endswith(".xlsx") else pd.read_csv(uploaded)
+        df.to_csv("category_map1.csv", index=False)
+        st.success("Uploaded — reload app")
+    
     st.stop()
 
-leaves, vectorizer, matrix, all_paths = load_or_build_index(map_file)
+# ─────────────────────────────────────────────
+# INDEX (SAFE)
+# ─────────────────────────────────────────────
 
-tab1, tab2 = st.tabs(["Single", "Batch"])
+@st.cache_resource
+def load_index(path):
+    if os.path.exists(INDEX_FILE):
+        try:
+            with open(INDEX_FILE, "rb") as f:
+                version, data = pickle.load(f)
+                if version == CACHE_VERSION:
+                    return data
+        except:
+            pass
 
-# ─────────────────────────────────────────────────────────────
-# SINGLE
-# ─────────────────────────────────────────────────────────────
+    df = pd.read_csv(path) if path.endswith(".csv") else pd.read_excel(path)
+
+    paths = df.iloc[:, 2].dropna().astype(str).tolist()
+    path_set = set(paths)
+
+    leaves = [p for p in paths if not any(o.startswith(p + " / ") for o in path_set)]
+
+    docs = [" ".join(p.split(" / ")) for p in leaves]
+
+    vec = TfidfVectorizer(ngram_range=(1, 2))
+    mat = vec.fit_transform(docs)
+
+    data = (leaves, vec, mat)
+
+    with open(INDEX_FILE, "wb") as f:
+        pickle.dump((CACHE_VERSION, data), f)
+
+    return data
+
+leaves, vectorizer, matrix = load_index(map_file)
+
+# ─────────────────────────────────────────────
+# CACHE
+# ─────────────────────────────────────────────
+
+def load_cache():
+    if os.path.exists(CACHE_FILE):
+        try:
+            return json.load(open(CACHE_FILE))
+        except:
+            return {}
+    return {}
+
+def save_cache(c):
+    json.dump(c, open(CACHE_FILE, "w"), indent=2)
+
+def find_cache(q, cache):
+    q = q.lower()
+    if q in cache:
+        return cache[q]
+    return None
+
+# ─────────────────────────────────────────────
+# AI
+# ─────────────────────────────────────────────
+
+@retry(stop=stop_after_attempt(3), wait=wait_exponential())
+async def async_ai(q, cands, client, sem):
+    async with sem:
+        resp = await client.chat.completions.create(
+            model=model_choice,
+            temperature=0.1,
+            response_format={"type": "json_object"},
+            messages=[
+                {"role": "system", "content": "Pick best category"},
+                {"role": "user", "content": q + "\n" + "\n".join(cands)}
+            ],
+        )
+        return json.loads(resp.choices[0].message.content)
+
+# ─────────────────────────────────────────────
+# SINGLE TAB
+# ─────────────────────────────────────────────
 
 with tab1:
-    query = st.text_input("Product Title")
+    query = st.text_input("Product title")
 
     if st.button("Predict"):
         cache = load_cache()
-        cached, key, _ = find_in_cache(query, cache)
 
+        cached = find_cache(query, cache)
         if cached:
-            st.markdown(f'<div class="cache-badge">Cache: {key}</div>', unsafe_allow_html=True)
+            st.markdown('<p class="cache">From cache</p>', unsafe_allow_html=True)
             st.write(cached)
         else:
-            qvec = vectorizer.transform([query])
-            sims = cosine_similarity(qvec, matrix)[0]
-
+            sims = cosine_similarity(vectorizer.transform([query]), matrix)[0]
             idxs = np.argsort(sims)[::-1][:shortlist_k]
-            cands = [leaves[i] for i in idxs if sims[i] > 0]
+            cands = [leaves[i] for i in idxs]
 
-            client = Groq(api_key=api_key)
+            if not api_key:
+                st.error("No API key")
+            else:
+                client = Groq(api_key=api_key)
+                resp = client.chat.completions.create(
+                    model=model_choice,
+                    response_format={"type": "json_object"},
+                    messages=[
+                        {"role": "system", "content": "Pick best category"},
+                        {"role": "user", "content": query + "\n" + "\n".join(cands)}
+                    ],
+                )
+                out = json.loads(resp.choices[0].message.content)
+                cache[query] = out
+                save_cache(cache)
+                st.write(out)
 
-            resp = client.chat.completions.create(
-                model=model_choice,
-                temperature=0.1,
-                response_format={"type": "json_object"},
-                messages=[
-                    {"role": "system", "content": SYSTEM_TEMPLATE},
-                    {"role": "user", "content": f"{query}\n\n" + "\n".join(cands)}
-                ],
-            )
-
-            preds = json.loads(resp.choices[0].message.content)["categories"]
-
-            cache[query] = preds
-            save_to_cache(cache)
-
-            st.write(preds)
-
-# ─────────────────────────────────────────────────────────────
-# BATCH
-# ─────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────
+# BATCH TAB
+# ─────────────────────────────────────────────
 
 with tab2:
-    file = st.file_uploader("Upload file")
+    uploaded = st.file_uploader("Upload CSV/XLSX", type=["csv", "xlsx"], key="batch")
 
-    if file and st.button("Run Batch"):
-        df = pd.read_excel(file) if file.name.endswith(".xlsx") else pd.read_csv(file)
+    if uploaded and st.button("Run Batch"):
+        df = pd.read_excel(uploaded) if uploaded.name.endswith(".xlsx") else pd.read_csv(uploaded)
 
         titles = df.iloc[:, 0].astype(str).tolist()
         cache = load_cache()
 
         results = []
-        to_idx, to_q = [], []
-
-        progress = st.progress(0)
-        table = st.empty()
+        todo = []
 
         for i, q in enumerate(titles):
-            cached, _, _ = find_in_cache(q, cache)
-            if cached:
-                results.append({"Title": q, "Category": cached[0]["category"], "Status": "Cached"})
+            c = find_cache(q, cache)
+            if c:
+                results.append({"Title": q, "Category": c, "Status": "Cached"})
             else:
-                results.append({"Title": q, "Category": "Pending", "Status": "Pending"})
-                to_idx.append(i)
-                to_q.append(q)
+                results.append({"Title": q, "Category": "", "Status": "Pending"})
+                todo.append((i, q))
 
+        table = st.empty()
         table.dataframe(results)
 
-        if to_q:
-            qmat = vectorizer.transform(to_q)
-            sims = cosine_similarity(qmat, matrix)
-
-            all_cands = []
-            for row in sims:
-                idxs = np.argsort(row)[::-1][:shortlist_k]
-                all_cands.append([leaves[i] for i in idxs if row[i] > 0])
-
+        if todo and api_key:
             client = AsyncGroq(api_key=api_key)
             sem = asyncio.Semaphore(concurrency)
 
-            async def run_chunk(start, end):
-                tasks = [
-                    async_rerank(i, q, c, client, model_choice, top_n, sem)
-                    for i, q, c in zip(to_idx[start:end], to_q[start:end], all_cands[start:end])
-                ]
+            async def run():
+                tasks = []
+                for i, q in todo:
+                    sims = cosine_similarity(vectorizer.transform([q]), matrix)[0]
+                    idxs = np.argsort(sims)[::-1][:shortlist_k]
+                    cands = [leaves[x] for x in idxs]
+
+                    tasks.append(async_ai(q, cands, client, sem))
+
                 return await asyncio.gather(*tasks)
 
-            for i in range(0, len(to_q), concurrency):
-                chunk = asyncio.run(run_chunk(i, i + concurrency))
+            outputs = asyncio.run(run())
 
-                for idx, preds in chunk:
-                    results[idx]["Category"] = preds[0]["category"] if preds else "Error"
-                    results[idx]["Status"] = "Done"
-                    cache[titles[idx]] = preds
+            for (i, q), out in zip(todo, outputs):
+                results[i]["Category"] = out
+                results[i]["Status"] = "Done"
+                cache[q] = out
 
-                progress.progress(min(100, int((i + concurrency) / len(to_q) * 100)))
                 table.dataframe(results)
 
-            save_to_cache(cache)
-            st.success("Batch complete")
+            save_cache(cache)
+            st.success("Done")
