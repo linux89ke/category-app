@@ -207,37 +207,49 @@ def get_embedding_model() -> SentenceTransformer:
     return SentenceTransformer("all-MiniLM-L6-v2")
 
 
-@st.cache_resource(show_spinner="Building semantic category index…")
 def load_or_build_index(file_path: str, cache_file: str = "category_index.pkl"):
+    # ── Layer 1: already loaded this browser session — zero cost ──────────
+    if "category_index" in st.session_state:
+        return st.session_state["category_index"]
+
+    # ── Layer 2: valid pickle on disk — just a file read, no encoding ─────
     needs_rebuild = True
-    if os.path.exists(cache_file) and file_path and os.path.exists(file_path):
-        if os.path.getmtime(cache_file) > os.path.getmtime(file_path):
-            needs_rebuild = False
+    if os.path.exists(cache_file):
+        if not file_path or not os.path.exists(file_path):
+            needs_rebuild = False          # no source file → trust the pickle
+        elif os.path.getmtime(cache_file) > os.path.getmtime(file_path):
+            needs_rebuild = False          # pickle is newer than source Excel
 
     if not needs_rebuild:
         with open(cache_file, "rb") as f:
-            return pickle.load(f)
+            result = pickle.load(f)
+        st.session_state["category_index"] = result
+        return result
 
-    try:
-        df = pd.read_excel(file_path)
-    except Exception:
-        df = pd.read_csv(file_path)
+    # ── Layer 3: full rebuild — only runs once, ever ───────────────────────
+    with st.spinner("Building semantic category index… (one-time only, will not repeat)"):
+        try:
+            df = pd.read_excel(file_path)
+        except Exception:
+            df = pd.read_csv(file_path)
 
-    all_paths = df.iloc[:, 2].dropna().astype(str).tolist()
-    path_set  = set(all_paths)
-    leaves = [
-        p for p in all_paths
-        if not any(other.startswith(p + " / ") for other in path_set)
-    ]
+        all_paths = df.iloc[:, 2].dropna().astype(str).tolist()
+        path_set  = set(all_paths)
+        leaves = [
+            p for p in all_paths
+            if not any(other.startswith(p + " / ") for other in path_set)
+        ]
 
-    # [5] enriched docs for better embedding quality
-    docs   = [normalize_path(p) for p in leaves]
-    model  = get_embedding_model()
-    matrix = model.encode(docs, show_progress_bar=False)
+        # [5] enriched docs for better embedding quality
+        docs   = [normalize_path(p) for p in leaves]
+        model  = get_embedding_model()
+        matrix = model.encode(docs, show_progress_bar=False)
 
-    result = (leaves, matrix, all_paths)
-    with open(cache_file, "wb") as f:
-        pickle.dump(result, f)
+        result = (leaves, matrix, all_paths)
+        with open(cache_file, "wb") as f:
+            pickle.dump(result, f)
+
+    st.session_state["category_index"] = result
     return result
 
 
