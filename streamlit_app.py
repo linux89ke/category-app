@@ -1,233 +1,516 @@
+"""
+Product Category Predictor
+Strategy : Semantic Embeddings shortlist + async parallel Groq reranking
+Speed    : all products run concurrently, ~2-5s for any batch size
+Cost     : 1 Groq call per product
+"""
+
+import os
+import io
+import json
+import asyncio
+import pickle
+import numpy as np
 import streamlit as st
 import pandas as pd
-import numpy as np
-import os
-import re
-from sklearn.feature_extraction.text import TfidfVectorizer
+import plotly.graph_objects as go
 from sklearn.metrics.pairwise import cosine_similarity
-from rapidfuzz import fuzz
+from groq import AsyncGroq, Groq
 
-# ==============================================================================
-# 1. SETTINGS & PROFESSIONAL STYLE
-# ==============================================================================
-st.set_page_config(page_title="Category Test", layout="wide")
-CATEGORY_FILE = "category_map_fully_enriched.xlsx"
+# New imports for auto-retries and semantic search
+from tenacity import retry, stop_after_attempt, wait_exponential
+from sentence_transformers import SentenceTransformer
+
+st.set_page_config(
+    page_title="Product Category Predictor", 
+    layout="wide", 
+    initial_sidebar_state="expanded"
+)
 
 st.markdown("""
 <style>
-    @import url('https://fonts.googleapis.com/css2?family=IBM+Plex+Mono&family=IBM+Plex+Sans:wght@300;400;600&display=swap');
-    html, body, [class*="css"] { font-family: 'IBM Plex Sans', sans-serif; }
-    .stApp { background-color: #f8f9fa; color: #1c1e21; }
-    h1 { font-family: 'IBM Plex Mono', monospace !important; color: #000000 !important; border-bottom: 2px solid #000000; padding-bottom: 10px; }
-    .stButton > button { background: #000000 !important; color: white !important; border-radius: 4px; width: 100%; border: none; font-weight: 600; height: 45px; }
+    .main-title {
+        font-size:2.4rem; font-weight:700;
+        background:linear-gradient(90deg,#f55036 0%,#ff8c00 100%);
+        -webkit-background-clip:text; -webkit-text-fill-color:transparent;
+        margin-bottom:0.2rem;
+    }
+    .subtitle { color:#888; font-size:1rem; margin-bottom:1.5rem; }
+    .result-card {
+        background:#f8f9fc; border-left:4px solid #f55036;
+        padding:0.8rem 1rem; border-radius:0 8px 8px 0; margin-bottom:0.5rem;
+    }
+    .stTextArea textarea { border-radius:10px !important; border:2px solid #e0e0f0 !important; }
+    .stTextArea textarea:focus { border-color:#f55036 !important; }
 </style>
 """, unsafe_allow_html=True)
 
-st.title("Category Test")
-st.caption("Taxonomy Audit | Un-Truncated Keywords | Additive Scoring | Version 2026.16")
 
-# ==============================================================================
-# 2. LOGIC HELPERS & CLEANERS
-# ==============================================================================
-_INVALID_NAMES = re.compile(r'^\s*(deleted|invalid|n\/a|na|null|none|test|sample|placeholder|tbd|xxx|remove|dummy)\s*$', re.I)
+# ─── Semantic Search Index ────────────────────────────────────────────────────
 
-DOMAIN_SIGNALS = {
-    "phone": {"Phones & Tablets"}, "mobile": {"Phones & Tablets"}, "tablet": {"Phones & Tablets"},
-    "laptop": {"Computing"}, "computer": {"Computing"}, "notebook": {"Computing"},
-    "shoe": {"Fashion"}, "sneaker": {"Fashion"}, "dress": {"Fashion"},
-    "watch": {"Fashion", "Electronics", "Phones & Tablets"},
-    "tv": {"Electronics"}, "television": {"Electronics"}, "headphone": {"Electronics"},
-    "diaper": {"Grocery", "Baby Products"}, "perfume": {"Health & Beauty"}, "foundation": {"Health & Beauty"},
-    "bike": {"Sporting Goods", "Automobile"}, "pot": {"Home & Office"}
-}
+@st.cache_resource(show_spinner=False)
+def get_embedding_model():
+    # all-MiniLM-L6-v2 is fast, lightweight, and highly accurate for semantic search
+    return SentenceTransformer('all-MiniLM-L6-v2')
 
-def is_invalid_name(text):
-    if not isinstance(text, str) or len(text.strip()) < 3: return True
-    return bool(_INVALID_NAMES.match(text.strip()))
 
-_STRIP_UNITS = re.compile(r'\b\d+\.?\d*\s*(?:ml|cl|l|pcs|inch|cm|mm|kw|kg|oz|lbs?)\b', re.IGNORECASE)
-_PUNCT = re.compile(r"[^a-z0-9\s]")
+@st.cache_resource(show_spinner=False)
+def load_or_build_index(file_path: str, cache_file="category_index.pkl"):
+    model = get_embedding_model()
+    
+    # If the pre-computed index exists on disk, load it instantly
+    if os.path.exists(cache_file):
+        with open(cache_file, "rb") as f:
+            return pickle.load(f)
 
-def clean_product(text: str) -> str:
-    """Cleans product names, stripping measurement noise."""
-    if not isinstance(text, str): return ""
-    text = text[:150].lower() 
-    text = _STRIP_UNITS.sub(" ", text)
-    text = _PUNCT.sub(" ", text)
-    return " ".join(text.split()).strip()
-
-def clean_keywords(text: str) -> str:
-    """NEVER truncate the keywords! Strip punctuation only."""
-    if not isinstance(text, str): return ""
-    text = text.lower()
-    text = _PUNCT.sub(" ", text)
-    return " ".join(text.split()).strip()
-
-def normalize_path(path_str: str) -> str:
-    if not isinstance(path_str, str): return ""
-    return re.sub(r"[^a-z0-9]", "", path_str.lower())
-
-def resolve_path_idx(norm_assigned: str, path_map: dict) -> int | None:
-    if norm_assigned in path_map: return path_map[norm_assigned]
-    if not norm_assigned: return None
-    best_score, best_idx = 0, None
-    for key, idx in path_map.items():
-        score = fuzz.ratio(norm_assigned, key)
-        if score > best_score:
-            best_score, best_idx = score, idx
-    return best_idx if best_score >= 90 else None
-
-# ==============================================================================
-# 3. INDEX BUILDER
-# ==============================================================================
-@st.cache_resource(show_spinner="Initializing Taxonomy Logic...")
-def build_index():
+    # Otherwise, build it from the Excel/CSV file
     try:
-        df = pd.read_excel(CATEGORY_FILE, engine="openpyxl")
-        df = df.loc[:, ~df.columns.str.contains("^Unnamed")]
-        path_col  = next((c for c in df.columns if "PATH" in c.upper()), df.columns[2])
-        kw_col    = next((c for c in df.columns if "KEY"  in c.upper()), None)
-        code_col  = next((c for c in df.columns if "CODE" in c.upper()), None)
+        df = pd.read_excel(file_path)
+    except Exception:
+        df = pd.read_csv(file_path)
+        
+    all_paths = df.iloc[:, 2].dropna().astype(str).tolist()
+    path_set  = set(all_paths)
+    leaves    = [p for p in all_paths if not any(other.startswith(p + " / ") for other in path_set)]
+    
+    # We replace "/" with spaces so the model reads it as a fluid sentence of concepts
+    docs = [p.replace(" / ", " ") for p in leaves]
+    
+    # Encode the category paths into semantic vectors
+    matrix = model.encode(docs, show_progress_bar=False)
+    
+    result = (leaves, matrix, all_paths)
+    
+    # Save to disk for future runs
+    with open(cache_file, "wb") as f:
+        pickle.dump(result, f)
+        
+    return result
 
-        df["path_str"]  = df[path_col].astype(str).str.strip()
-        df["norm_path"] = df["path_str"].apply(normalize_path)
-        df["leaf_name"] = df["path_str"].apply(lambda x: x.split("/")[-1].strip().lower())
 
-        # Process Keywords WITHOUT Truncation
-        df["kw_list"] = (
-            df[kw_col].fillna("").astype(str).apply(lambda x: set(clean_keywords(x).split()))
-            if kw_col else pd.Series([set()] * len(df))
+def shortlist(query: str, leaves, matrix, k: int = 15) -> list[str]:
+    model = get_embedding_model()
+    qvec = model.encode([query])
+    sims = cosine_similarity(qvec, matrix)[0]
+    top_idx = np.argsort(sims)[::-1][:k]
+    return [leaves[i] for i in top_idx if sims[i] > 0]
+
+
+def batch_shortlist(queries: list[str], leaves, matrix, k: int = 15) -> list[list[str]]:
+    model = get_embedding_model()
+    qmat = model.encode(queries, show_progress_bar=False)
+    sims = cosine_similarity(qmat, matrix)          
+    results = []
+    for row in sims:
+        top_idx = np.argsort(row)[::-1][:k]
+        results.append([leaves[i] for i in top_idx if row[i] > 0])
+    return results
+
+
+# ─── Async Groq reranking ─────────────────────────────────────────────────────
+
+# We added Few-Shot Prompting here to fix the "Sets" vs "Single Items" issue.
+SYSTEM_TEMPLATE = """You are a product categorization expert.
+Given a product title and a list of candidate category paths, pick the {top_n} best matching categories.
+Consider brand, product type, gender, style, material, and QUANTITY.
+
+CRITICAL RULE: Pay attention to plurals, packs, and sets. If a product is a single item, DO NOT put it in a "Sets" category. If it is a set, DO NOT put it in a single item category.
+
+EXAMPLE INPUT:
+Product: "Acrylic Fruit and Salad Bowl with Gold Rim Elegant Transparent Serving Bowl"
+Candidates:
+- Home & Kitchen / Kitchen & Dining / Dining & Entertaining / Serveware / Salad Serving Sets
+- Home & Kitchen / Kitchen & Dining / Dining & Entertaining / Serveware / Serving Bowls
+
+EXAMPLE OUTPUT:
+{{
+  "categories": [
+    {{"category": "Home & Kitchen / Kitchen & Dining / Dining & Entertaining / Serveware / Serving Bowls", "score": 0.98}},
+    {{"category": "Home & Kitchen / Kitchen & Dining / Dining & Entertaining / Serveware / Salad Serving Sets", "score": 0.05}}
+  ]
+}}
+
+Rules:
+- Return exactly {top_n} categories ordered by confidence descending
+- Only pick from the provided candidate list — never invent categories
+- Scores are floats 0.0–1.0
+- JSON only, nothing else"""
+
+# Added auto-retry logic: retries up to 3 times, waiting exponentially (2s, 4s, 8s) if Groq drops the connection.
+@retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=2, max=10))
+async def async_rerank(
+    idx: int,
+    query: str,
+    candidates: list[str],
+    client: AsyncGroq,
+    model: str,
+    top_n: int,
+    semaphore: asyncio.Semaphore,
+) -> tuple[int, list[dict]]:
+    """Rerank candidates for a single product. Returns (original_index, results)."""
+    async with semaphore:
+        cand_list = "\n".join(f"- {c}" for c in candidates)
+        resp = await client.chat.completions.create(
+            model=model,
+            temperature=0.1,
+            response_format={"type": "json_object"},
+            messages=[
+                {"role": "system",
+                 "content": SYSTEM_TEMPLATE.format(top_n=top_n)},
+                {"role": "user",
+                 "content": f"Product: {query}\n\nCandidates:\n{cand_list}"},
+            ],
         )
+        raw  = resp.choices[0].message.content.strip()
+        data = json.loads(raw).get("categories", [])
+        return idx, data
 
-        p_clean = df["path_str"].str.replace("/", " ").str.lower()
-        k_clean = df[kw_col].fillna("").astype(str).str.lower() if kw_col else pd.Series([""] * len(df))
-        df["search_text"] = (p_clean + " ") * 3 + (k_clean + " ") * 5
 
-        vectorizer   = TfidfVectorizer(ngram_range=(1, 2), sublinear_tf=True)
-        tfidf_matrix = vectorizer.fit_transform(df["search_text"])
+async def parallel_predict(
+    queries: list[str],
+    candidates_list: list[list[str]],
+    api_key: str,
+    model: str,
+    top_n: int,
+    concurrency: int,
+) -> list[list[dict]]:
+    """Fire all Groq calls concurrently, bounded by semaphore."""
+    client    = AsyncGroq(api_key=api_key)
+    semaphore = asyncio.Semaphore(concurrency)
+    tasks     = []
+    
+    for i, (q, c) in enumerate(zip(queries, candidates_list)):
+        # Wrap the async_rerank in a try-except to catch cases where all 3 retries fail
+        async def safe_rerank(idx, query, cands):
+            try:
+                return await async_rerank(idx, query, cands, client, model, top_n, semaphore)
+            except Exception as e:
+                return idx, [{"category": f"API ERROR: {e}", "score": 0.0}]
+        tasks.append(safe_rerank(i, q, c))
+        
+    results_raw = await asyncio.gather(*tasks)
+    ordered = sorted(results_raw, key=lambda x: x[0])
+    return [r for _, r in ordered]
 
-        norm_path_to_idx = {row["norm_path"]: i for i, row in df.iterrows()}
-        code_to_path = (
-            dict(zip(df[code_col].astype(str).str.replace(r"\.0$", "", regex=True), df[path_col]))
-            if code_col else {}
-        )
 
-        return df, vectorizer, tfidf_matrix, code_to_path, path_col, norm_path_to_idx
+def run_parallel(queries, candidates_list, api_key, model, top_n, concurrency):
+    return asyncio.run(
+        parallel_predict(queries, candidates_list, api_key, model, top_n, concurrency)
+    )
 
-    except Exception as e:
-        st.error(f"Load Error: {e}")
-        return None, None, None, None, None, None
 
-index_data = build_index()
-if index_data[0] is not None:
-    df_cat, vectorizer, tfidf_matrix, master_code_map, PATH_COL_NAME, path_map = index_data
-else:
+def sync_rerank(query, candidates, api_key, model, top_n):
+    client    = Groq(api_key=api_key)
+    cand_list = "\n".join(f"- {c}" for c in candidates)
+    resp = client.chat.completions.create(
+        model=model,
+        temperature=0.1,
+        response_format={"type": "json_object"},
+        messages=[
+            {"role": "system", "content": SYSTEM_TEMPLATE.format(top_n=top_n)},
+            {"role": "user",   "content": f"Product: {query}\n\nCandidates:\n{cand_list}"},
+        ],
+    )
+    return json.loads(resp.choices[0].message.content.strip()).get("categories", [])
+
+
+# ─── Result renderer ──────────────────────────────────────────────────────────
+
+def render_results(preds, score_threshold, show_chart, show_hierarchy):
+    preds = [p for p in preds if p.get("score", 0) >= score_threshold]
+    if not preds:
+        st.warning("No categories above the confidence threshold.")
+        return
+
+    left, right = (st.columns([1, 1]) if show_chart else (st, None))
+
+    with left:
+        st.markdown("#### Top Predictions")
+        for i, p in enumerate(preds):
+            pct   = p["score"] * 100
+            color = "#f55036" if pct > 60 else "#ff8c00" if pct > 30 else "#ffd580"
+            st.markdown(f"""
+            <div class="result-card">
+              <span style="font-size:.72rem;font-weight:700;color:#f55036;text-transform:uppercase;">#{i+1}</span>
+              <div style="font-size:1rem;font-weight:600;color:#1a1a2e;">{p['category']}</div>
+              <div style="display:flex;align-items:center;gap:8px;margin-top:4px;">
+                <div style="flex:1;height:6px;background:#e8eaf6;border-radius:3px;">
+                  <div style="width:{int(pct)}%;height:100%;background:{color};border-radius:3px;"></div>
+                </div>
+                <span style="font-size:.88rem;color:#555;">{pct:.1f}%</span>
+              </div>
+            </div>""", unsafe_allow_html=True)
+
+    if show_chart and right:
+        with right:
+            st.markdown("#### Confidence Chart")
+            df = pd.DataFrame(preds).sort_values("score")
+            df["label"] = df["category"].apply(
+                lambda x: " / ".join(x.split(" / ")[-2:]) if " / " in x else x)
+            fig = go.Figure(go.Bar(
+                x=df["score"]*100, y=df["label"], orientation="h",
+                marker=dict(color=df["score"]*100,
+                            colorscale=[[0,"#ffd580"],[0.5,"#ff8c00"],[1,"#f55036"]],
+                            showscale=False),
+                text=[f"{s*100:.1f}%" for s in df["score"]],
+                textposition="outside",
+                hovertext=df["category"], hoverinfo="text+x",
+            ))
+            fig.update_layout(
+                xaxis_title="Confidence (%)",
+                margin=dict(l=0, r=60, t=10, b=30),
+                height=max(300, len(preds)*36),
+                plot_bgcolor="rgba(0,0,0,0)", paper_bgcolor="rgba(0,0,0,0)",
+                xaxis=dict(range=[0, 115]),
+            )
+            st.plotly_chart(fig, use_container_width=True)
+
+    if show_hierarchy:
+        lines, seen = [], set()
+        for p in preds:
+            parts = [x.strip() for x in p["category"].split(" / ") if x.strip()]
+            if len(parts) > 1:
+                if parts[0] not in seen:
+                    lines.append(f"**{parts[0]}**")
+                    seen.add(parts[0])
+                for d, part in enumerate(parts[1:], 1):
+                    lines.append(f"{'  '*d}└─ {part}")
+            else:
+                lines.append(f"{p['category']}")
+        if lines:
+            st.markdown("#### Category Hierarchy")
+            st.markdown("\n".join(lines))
+
+
+# ─── Sidebar ──────────────────────────────────────────────────────────────────
+
+with st.sidebar:
+    st.markdown("## Groq API Key")
+    api_key = st.text_input("Paste your key here:",
+                            value=os.environ.get("GROQ_API_KEY", ""),
+                            type="password", placeholder="gsk_...")
+    st.caption("Free key at console.groq.com")
+
+    st.markdown("---")
+    st.markdown("## Settings")
+    model_choice = st.selectbox(
+        "Groq model",
+        ["llama-3.1-8b-instant", "llama-3.3-70b-versatile", "mixtral-8x7b-32768"],
+        index=0,
+    )
+    top_n        = st.slider("Top N results", 1, 10, 5)
+    shortlist_k  = st.slider("Shortlist size", 5, 50, 15,
+                             help="Candidates sent to Groq per product.")
+    concurrency  = st.slider("Parallel requests", 1, 30, 10)
+    score_threshold = st.slider("Min confidence", 0.0, 1.0, 0.0, 0.05)
+    show_chart   = st.checkbox("Show confidence chart", value=True)
+    show_hierarchy = st.checkbox("Show category hierarchy", value=True)
+
+    st.markdown("---")
+    st.markdown("""### Updates
+- **Semantic Search:** Understands context and meaning.
+- **Few-Shot Prompting:** Trained to avoid putting single items into 'Set' categories.
+- **Auto-Retries:** Automatically retries API calls if they fail.
+- **Interactive Tables:** You can edit the results grid before downloading.
+""")
+
+# ─── Main ─────────────────────────────────────────────────────────────────────
+
+st.markdown('<p class="main-title">Product Category Predictor</p>', unsafe_allow_html=True)
+st.markdown('<p class="subtitle">Semantic shortlist + async parallel Groq — fast, accurate, 1 API call per product.</p>', unsafe_allow_html=True)
+
+if not api_key:
+    st.info("Enter your Groq API key in the sidebar.")
     st.stop()
 
-# ==============================================================================
-# 4. ADDITIVE SCORING ENGINE (Max 100 Points)
-# ==============================================================================
-def score_assignment(clean_q: str, assigned_path: str, sims_row) -> float:
-    norm_assigned = normalize_path(assigned_path)
-    idx = resolve_path_idx(norm_assigned, path_map)
-    if idx is None: return 0.0
+# Ensure local file exists or cached pickle exists
+excel_path = "category_map1.xlsx"
+cache_path = "category_index.pkl"
 
-    row       = df_cat.iloc[idx]
-    cos_score = float(sims_row[idx])
-    leaf      = row["leaf_name"]
-    full_path = str(row[PATH_COL_NAME]).lower()
+if not os.path.exists(excel_path) and not os.path.exists(cache_path):
+    st.error(f"Required file '{excel_path}' not found in the script directory.")
+    st.stop()
 
-    query_tokens = set(clean_q.split())
-    query_stems  = {t.rstrip("s") for t in query_tokens}
+with st.spinner("Loading semantic category index..."):
+    # Note: `vectorizer` is no longer needed since we use embeddings directly
+    leaves, matrix, all_paths = load_or_build_index(excel_path, cache_path)
 
-    # 1. KEYWORD MATCH (Max 45 Points)
-    # +15 points for every matched keyword, up to a max of 45.
-    kw_overlap = len(query_tokens & row["kw_list"])
-    comp_kw = min(kw_overlap * 15.0, 45.0)
+st.success(f"Successfully loaded {len(leaves):,} leaf categories.")
 
-    # 2. LITERAL LEAF MATCH (Max 20 Points)
-    # If any significant word from the category name is in the product name
-    leaf_words = [w.rstrip("s") for w in leaf.replace("&", " ").split() if len(w) >= 3]
-    literal_hit = bool(leaf_words and any(lw in query_stems for lw in leaf_words))
-    comp_literal = 20.0 if literal_hit else 0.0
+# ─── Tabs ─────────────────────────────────────────────────────────────────────
 
-    # 3. TF-IDF COSINE MATCH (Max 25 Points)
-    comp_cos = cos_score * 25.0
+tab_single, tab_batch, tab_explore = st.tabs(["Single Predict", "Batch Predict", "Explore"])
 
-    # 4. FUZZY PATH MATCH (Max 10 Points)
-    fuzz_ratio = fuzz.token_set_ratio(clean_q, full_path) / 100.0
-    comp_fuzz = fuzz_ratio * 10.0
+EXAMPLES = [
+    "Acrylic Fruit and Salad Bowl with Gold Rim",
+    "AirPods Pro 2nd Generation Wireless Earbuds",
+    "LEGO Star Wars Skywalker Saga Nintendo Switch",
+    "KitchenAid 5-Quart Artisan Stand Mixer",
+    "Harry Potter Sorcerer's Stone Hardcover",
+]
 
-    # 5. DOMAIN PENALTY (-40 Points)
-    top_level = str(row[PATH_COL_NAME]).split("/")[0].strip()
-    required_verticals = set()
-    for tok in query_tokens:
-        if tok in DOMAIN_SIGNALS:
-            required_verticals |= DOMAIN_SIGNALS[tok]
-    penalty = 40.0 if (required_verticals and top_level not in required_verticals) else 0.0
+# ── Single ─────────────────────────────────────────────────────────────────────
+with tab_single:
+    st.markdown("### Enter a product title")
+    st.markdown("**Quick examples:**")
+    cols = st.columns(3)
+    for i, ex in enumerate(EXAMPLES):
+        short = ex[:46] + "..." if len(ex) > 46 else ex
+        if cols[i % 3].button(short, key=f"ex_{i}", use_container_width=True):
+            st.session_state["product_text"] = ex
 
-    # FINAL MATH
-    score = comp_kw + comp_literal + comp_cos + comp_fuzz - penalty
-    return round(min(max(score, 0.0), 100.0), 1)
-
-# ==============================================================================
-# 5. UI
-# ==============================================================================
-with st.sidebar:
-    st.header("Parameters")
-    threshold = st.slider("Audit Threshold", 0, 100, 20)
-    st.caption("Standard: ≥ 20.0 is Approved.")
-
-uploaded_file = st.file_uploader("Upload CSV for Audit", type="csv")
-
-if uploaded_file:
-    df_up = pd.read_csv(uploaded_file, sep=None, engine="python", on_bad_lines="skip")
-    name_col = next((c for c in df_up.columns if "NAME" in c.upper()), df_up.columns[0])
-    code_col = next((c for c in df_up.columns if "CODE" in c.upper() and "AI" not in c.upper()), None)
-
-    if st.button("Run Audit Analysis", width="stretch"):
-        if code_col:
-            clean_codes = df_up[code_col].astype(str).str.replace(r"\.0$", "", regex=True).str.strip()
-            df_up["Assigned category in full"] = clean_codes.map(master_code_map).fillna("Unknown")
-        else:
-            df_up["Assigned category in full"] = df_up.get("CATEGORY", "N/A")
-
-        names   = df_up[name_col].fillna("").astype(str).tolist()
-        cleaned = [clean_product(n) if not is_invalid_name(n) else "" for n in names]
-
-        q_vecs   = vectorizer.transform(cleaned)
-        all_sims = cosine_similarity(q_vecs, tfidf_matrix)
-
-        results = []
-        for i in range(len(names)):
-            if not cleaned[i]:
-                results.append((0.0, "Rejected"))
-                continue
-            conf = score_assignment(cleaned[i], df_up["Assigned category in full"].iloc[i], all_sims[i])
-            status = "Approved" if conf >= threshold else "Rejected"
-            results.append((conf, status))
-
-        df_up["confidence"] = [r[0] for r in results]
-        df_up["status"]     = [r[1] for r in results]
-
-        final_cols = ["NAME", "Assigned category in full", "confidence", "status"]
-
-        total    = len(df_up)
-        approved = (df_up["status"] == "Approved").sum()
-        rejected = total - approved
-
-        col1, col2, col3 = st.columns(3)
-        col1.metric("Total Products", total)
-        col2.metric("Approved", approved, delta=f"{approved/total*100:.1f}%")
-        col3.metric("Rejected", rejected, delta=f"-{rejected/total*100:.1f}%", delta_color="inverse")
-
-        st.subheader("Audit Results")
-        st.dataframe(
-            df_up[final_cols].head(2500),
-            column_config={
-                "confidence": st.column_config.ProgressColumn("Confidence Score", min_value=0, max_value=100)
-            },
-            width="stretch",
-            hide_index=True,
+    col_title, col_brand = st.columns([3, 1])
+    with col_title:
+        product_text = st.text_area(
+            "Product title",
+            value=st.session_state.get("product_text", ""),
+            height=90,
+            placeholder="e.g. Air Max 270 Men's Running Shoes...",
         )
-        st.download_button("Export Results", df_up[final_cols].to_csv(index=False).encode("utf-8"), "category_audit_v16.csv")
+    with col_brand:
+        brand = st.text_input(
+            "Brand *(optional)*",
+            placeholder="e.g. Nike",
+        )
+
+    if st.button("Predict", type="primary", use_container_width=True):
+        if product_text.strip():
+            query = f"{brand.strip()} {product_text.strip()}".strip() if brand.strip() else product_text.strip()
+            with st.spinner("Shortlisting..."):
+                candidates = shortlist(query, leaves, matrix, shortlist_k)
+            with st.spinner(f"Asking Groq ({len(candidates)} candidates)..."):
+                try:
+                    preds = sync_rerank(query, candidates, api_key, model_choice, top_n)
+                    render_results(preds, score_threshold, show_chart, show_hierarchy)
+                    with st.expander(f"{len(candidates)} candidates sent to Groq"):
+                        for c in candidates:
+                            st.markdown(f"- {c}")
+                except Exception as e:
+                    st.error(f"Groq error: {e}")
+        else:
+            st.warning("Please enter a product title.")
+
+# ── Batch ──────────────────────────────────────────────────────────────────────
+with tab_batch:
+    st.markdown("### Batch predict")
+    top_n_batch = st.slider("Top N per product", 1, 5, 1, key="batch_topn")
+    input_mode  = st.radio("Input method",
+                           ["Upload file (CSV or Excel)", "Paste a list"],
+                           horizontal=True)
+
+    texts  = []
+    brands = []
+
+    if input_mode == "Upload file (CSV or Excel)":
+        uploaded = st.file_uploader("Upload CSV or Excel", type=["csv","xlsx","xls"])
+        if uploaded:
+            try:
+                if uploaded.name.endswith((".xlsx", ".xls")):
+                    df_input = pd.read_excel(uploaded)
+                else:
+                    try:
+                        df_input = pd.read_csv(uploaded, encoding="utf-8")
+                    except UnicodeDecodeError:
+                        uploaded.seek(0)
+                        df_input = pd.read_csv(uploaded, encoding="latin-1")
+
+                st.dataframe(df_input.head(5), use_container_width=True)
+                col_tc, col_bc = st.columns([2, 1])
+                with col_tc:
+                    text_col = st.selectbox("Product title column", df_input.columns.tolist())
+                with col_bc:
+                    brand_col = st.selectbox("Brand column *(optional)*",
+                                             ["— none —"] + df_input.columns.tolist())
+                texts  = df_input[text_col].astype(str).fillna("").tolist()
+                brands = (df_input[brand_col].astype(str).fillna("").tolist()
+                          if brand_col != "— none —" else [""] * len(texts))
+                st.caption(f"{len(texts):,} products — all will run in parallel.")
+            except Exception as e:
+                st.error(f"Could not read file: {e}")
+        else:
+            st.markdown("Supports `.csv`, `.xlsx`, `.xls`")
+
+    else:
+        pasted = st.text_area("Paste one product per line:", height=180,
+                              placeholder="Nike Air Max 270\nKitchenAid Stand Mixer")
+        brand_prefix = st.text_input("Brand *(optional — applies to all)*",
+                                     placeholder="e.g. Nike", key="paste_brand")
+        if pasted.strip():
+            texts  = [t.strip() for t in pasted.strip().splitlines() if t.strip()]
+            brands = [brand_prefix.strip() if brand_prefix else ""] * len(texts)
+            st.caption(f"{len(texts):,} products — all will run in parallel.")
+
+    if texts:
+        est_secs = max(2, len(texts) // concurrency + 2)
+        st.info(f"**{len(texts)} products** will run {concurrency} at a time — estimated **~{est_secs}s** total.")
+
+        if st.button("Run Batch Prediction", type="primary"):
+            import time
+
+            queries = [
+                f"{b.strip()} {t.strip()}".strip() if b.strip() else t.strip()
+                for t, b in zip(texts, brands)
+            ]
+
+            with st.spinner(f"Step 1: Shortlisting {len(queries)} products (Semantic Search)..."):
+                t0 = time.time()
+                all_candidates = batch_shortlist(queries, leaves, matrix, shortlist_k)
+                tfidf_ms = int((time.time() - t0) * 1000)
+
+            prog    = st.progress(0, text="Step 2: Sending all Groq calls in parallel...")
+            t1      = time.time()
+
+            all_preds = run_parallel(queries, all_candidates, api_key,
+                                     model_choice, top_n_batch, concurrency)
+
+            elapsed = time.time() - t1
+            prog.progress(1.0, text=f"Done in {elapsed:.1f}s ({tfidf_ms}ms Search + {elapsed:.1f}s Groq)")
+
+            # Build results table
+            rows = []
+            for text, b, preds in zip(texts, brands, all_preds):
+                rows.append({
+                    "input_text":   text,
+                    "brand":        b,
+                    "top_category": preds[0]["category"] if preds else "",
+                    "top_score":    round(preds[0]["score"], 4) if preds else 0,
+                    "top_3":        " | ".join(
+                        f"{p['category']} ({p['score']:.1%})" for p in preds[:3]
+                    ),
+                })
+
+            df_out = pd.DataFrame(rows)
+            
+            # Use st.data_editor instead of st.dataframe to allow the user to make manual corrections
+            st.markdown("#### Review Results (Click any cell to edit)")
+            edited_df = st.data_editor(df_out, use_container_width=True, num_rows="dynamic")
+            
+            st.download_button("Download Results CSV",
+                               edited_df.to_csv(index=False).encode(),
+                               "predictions.csv", "text/csv")
+
+# ── Explore ────────────────────────────────────────────────────────────────────
+with tab_explore:
+    st.markdown("### Explore Category Map")
+    tops = sorted(set(p.split(" / ")[0] for p in all_paths))
+    c1, c2, c3 = st.columns(3)
+    c1.metric("Total Paths", f"{len(all_paths):,}")
+    c2.metric("Leaf Categories", f"{len(leaves):,}")
+    c3.metric("Top-level Groups", len(tops))
+
+    st.markdown("---")
+    search = st.text_input("Search", placeholder="e.g. Jeans, Headphones...")
+    if search:
+        results = [p for p in all_paths if search.lower() in p.lower()]
+        st.markdown(f"**{len(results):,} matches:**")
+        for p in results[:100]:
+            depth = len(p.split(" / ")) - 1
+            st.markdown(f"{'  '*depth}{'└─ ' if depth else ''}`{p}`")
+        if len(results) > 100:
+            st.caption(f"...and {len(results)-100} more.")
+    else:
+        st.markdown("**Top-level categories:**")
+        cols = st.columns(3)
+        for i, top in enumerate(tops):
+            count = sum(1 for p in leaves if p.startswith(top))
+            cols[i % 3].markdown(f"- **{top}** ({count:,} leaves)")
