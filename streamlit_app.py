@@ -23,7 +23,7 @@ from tenacity import retry, stop_after_attempt, wait_exponential
 
 CACHE_FILE = "prediction_cache.json"
 INDEX_FILE = "category_index.pkl"
-CACHE_VERSION = "v3"
+CACHE_VERSION = "v4"
 
 st.set_page_config(
     page_title="CatPredict",
