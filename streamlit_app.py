@@ -154,11 +154,7 @@ def batch_shortlist(queries: list[str], leaves, matrix, k: int = 25) -> list[lis
 
 SYSTEM_TEMPLATE = """You are a product categorization expert.
 Given a product title and a list of candidate category paths, pick the {top_n} best matching categories.
-Consider brand, product type, format/medium, gender, style, material, and QUANTITY.
-
-CRITICAL RULES:
-1. QUANTITY: Pay attention to plurals, packs, and sets. If a product is a single item, DO NOT put it in a "Sets" category.
-2. FORMAT/MEDIUM: Pay close attention to format keywords like 'Hardcover', 'Paperback', 'DVD', 'CD', 'Audiobook'. Do NOT categorize a physical book as a DVD, or a movie as a book.
+Consider format, quantity, brand, and type. 
 
 Rules:
 - Return exactly {top_n} categories ordered by confidence descending
@@ -184,6 +180,63 @@ async def async_rerank(
         data = json.loads(raw).get("categories", [])
         return idx, data
 
+# ─── UI Rendering Functions ────────────────────────────────────────────────
+
+def render_results(preds, score_threshold, show_chart, show_hierarchy):
+    preds = [p for p in preds if p.get("score", 0) >= score_threshold]
+    if not preds:
+        st.warning("No categories above the confidence threshold.")
+        return
+
+    left, right = (st.columns([1, 1]) if show_chart else (st, None))
+
+    with left:
+        st.markdown("#### Top Predictions")
+        for i, p in enumerate(preds):
+            pct   = p["score"] * 100
+            color = "#f55036" if pct > 60 else "#ff8c00" if pct > 30 else "#ffd580"
+            st.markdown(f"""
+            <div class="result-card">
+              <span style="font-size:.72rem;font-weight:700;color:#f55036;text-transform:uppercase;">#{i+1}</span>
+              <div style="font-size:1rem;font-weight:600;color:#1a1a2e;">{p['category']}</div>
+              <div style="display:flex;align-items:center;gap:8px;margin-top:4px;">
+                <div style="flex:1;height:6px;background:#e8eaf6;border-radius:3px;">
+                  <div style="width:{int(pct)}%;height:100%;background:{color};border-radius:3px;"></div>
+                </div>
+                <span style="font-size:.88rem;color:#555;">{pct:.1f}%</span>
+              </div>
+            </div>""", unsafe_allow_html=True)
+
+    if show_chart and right:
+        with right:
+            st.markdown("#### Confidence Chart")
+            df = pd.DataFrame(preds).sort_values("score")
+            df["label"] = df["category"].apply(lambda x: " / ".join(x.split(" / ")[-2:]) if " / " in x else x)
+            fig = go.Figure(go.Bar(
+                x=df["score"]*100, y=df["label"], orientation="h",
+                marker=dict(color=df["score"]*100, colorscale=[[0,"#ffd580"],[0.5,"#ff8c00"],[1,"#f55036"]], showscale=False),
+                text=[f"{s*100:.1f}%" for s in df["score"]], textposition="outside",
+                hovertext=df["category"], hoverinfo="text+x",
+            ))
+            fig.update_layout(xaxis_title="Confidence (%)", margin=dict(l=0, r=60, t=10, b=30), height=max(300, len(preds)*36),
+                              plot_bgcolor="rgba(0,0,0,0)", paper_bgcolor="rgba(0,0,0,0)", xaxis=dict(range=[0, 115]))
+            st.plotly_chart(fig, use_container_width=True)
+
+    if show_hierarchy:
+        lines, seen = [], set()
+        for p in preds:
+            parts = [x.strip() for x in p["category"].split(" / ") if x.strip()]
+            if len(parts) > 1:
+                if parts[0] not in seen:
+                    lines.append(f"**{parts[0]}**")
+                    seen.add(parts[0])
+                for d, part in enumerate(parts[1:], 1):
+                    lines.append(f"{'  '*d}└─ {part}")
+            else:
+                lines.append(f"{p['category']}")
+        if lines:
+            st.markdown("#### Category Hierarchy")
+            st.markdown("\n".join(lines))
 
 # ─── Sidebar ──────────────────────────────────────────────────────────────────
 
@@ -287,8 +340,6 @@ with tab_batch:
             pred_cache = load_cache()
             queries = [f"{b} {t}".strip() for t, b in zip(texts, brands)]
             
-            # Placeholders for real-time updates
-            progress_text = st.empty()
             progress_bar = st.progress(0)
             status_text = st.empty()
             table_placeholder = st.empty()
@@ -297,7 +348,6 @@ with tab_batch:
             to_predict_indices = []
             to_predict_queries = []
 
-            # Initialize results with cache or mark for prediction
             for i, q in enumerate(queries):
                 cached_val, matched_key, _ = find_in_cache(q, pred_cache)
                 if cached_val:
@@ -306,11 +356,10 @@ with tab_batch:
                            "top_score": cached_val[0]["score"] if cached_val else 0, "status": "Cached"}
                     results_list.append(res)
                 else:
-                    results_list.append({"input_text": texts[i], "brand": brands[i], "top_category": "Processing...", "top_score": 0, "status": "Pending"})
+                    results_list.append({"input_text": texts[i], "brand": brands[i], "top_category": "Pending...", "top_score": 0, "status": "Pending"})
                     to_predict_indices.append(i)
                     to_predict_queries.append(q)
 
-            # Show initial table
             table_placeholder.data_editor(pd.DataFrame(results_list), use_container_width=True, key="realtime_table")
 
             if to_predict_queries:
@@ -320,7 +369,6 @@ with tab_batch:
                 client = AsyncGroq(api_key=api_key)
                 semaphore = asyncio.Semaphore(concurrency)
 
-                # Process in chunks to update the UI
                 chunk_size = concurrency
                 for i in range(0, len(to_predict_queries), chunk_size):
                     chunk_queries = to_predict_queries[i : i + chunk_size]
@@ -330,25 +378,23 @@ with tab_batch:
                     tasks = [async_rerank(idx, q, c, client, model_choice, top_n_batch, semaphore) 
                              for idx, q, c in zip(chunk_indices, chunk_queries, chunk_cands)]
                     
-                    chunk_results = asyncio.run(asyncio.gather(*tasks))
+                    # Run async chunk
+                    loop = asyncio.new_event_loop()
+                    asyncio.set_event_loop(loop)
+                    chunk_results = loop.run_until_complete(asyncio.gather(*tasks))
                     
                     for original_idx, preds in chunk_results:
-                        # Update main result list
                         results_list[original_idx]["top_category"] = preds[0]["category"] if preds else "Error"
                         results_list[original_idx]["top_score"] = preds[0]["score"] if preds else 0
                         results_list[original_idx]["status"] = "AI Predicted"
-                        
-                        # Update Cache
                         pred_cache[queries[original_idx]] = preds
                     
-                    # Update UI
                     perc = min(100, int((i + chunk_size) / len(to_predict_queries) * 100))
                     progress_bar.progress(perc)
-                    progress_text.text(f"Processing: {perc}%")
                     table_placeholder.data_editor(pd.DataFrame(results_list), use_container_width=True, key=f"table_{i}")
                 
                 save_to_cache(pred_cache)
-                status_text.success("Batch Prediction Complete!")
+                status_text.success("Complete!")
             
             st.download_button("Download CSV", pd.DataFrame(results_list).to_csv(index=False).encode(), "results.csv")
 
