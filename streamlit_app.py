@@ -160,7 +160,7 @@ with st.sidebar:
 # ─────────────────────────────────────────────
 
 map_file = None
-for f in ["category_map1.csv", "category_map1.xlsx"]:
+for f in ["category_map1.xlsx - pim category attribute set.csv", "category_map1.csv", "category_map1.xlsx"]:
     if os.path.exists(f):
         map_file = f
         break
@@ -625,11 +625,11 @@ def run_batch_ui(titles: list[str]):
 # PLOTLY BASE
 # ─────────────────────────────────────────────
 
+# FIXED: Removed the duplicate 'margin' dict to prevent dictionary unpacking TypeError
 PLOTLY_BASE = dict(
     paper_bgcolor="rgba(0,0,0,0)",
     plot_bgcolor ="rgba(0,0,0,0)",
-    font=dict(family="DM Mono"),
-    margin=dict(l=0, r=20, t=10, b=10),
+    font=dict(family="DM Mono")
 )
 
 # ─────────────────────────────────────────────
